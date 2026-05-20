@@ -35,6 +35,7 @@ jobs:
       - name: Sign linux-amd64 binary
         run: |
           cosign sign-blob \
+            --yes \
             --output-signature dist/specter-scanner-linux-amd64.sig \
             dist/specter-scanner-linux-amd64
 
