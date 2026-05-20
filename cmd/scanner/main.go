@@ -323,7 +323,7 @@ func postToplatform(ctx context.Context, cfg *config.ScannerConfig, payload type
 		return fmt.Errorf("marshal: %w", err)
 	}
 
-	url := cfg.PlatformURL + "/v1/scanner/ingest"
+	url := cfg.PlatformURL + "/api/v1/ingest"
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(data))
 	if err != nil {
 		return fmt.Errorf("build request: %w", err)
@@ -331,7 +331,9 @@ func postToplatform(ctx context.Context, cfg *config.ScannerConfig, payload type
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+cfg.APIKey)
 	req.Header.Set("X-Specter-Signature", sig)
-	req.Header.Set("X-Scanner-Version", Version)
+	req.Header.Set("X-Specter-Scanner-Version", Version)
+	req.Header.Set("X-Specter-Scan-Id", payload.ScanID)
+	req.Header.Set("X-Specter-Org-Id", payload.OrgID)
 
 	client := &http.Client{Timeout: 30 * time.Second}
 	resp, err := client.Do(req)
