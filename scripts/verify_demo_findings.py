@@ -21,13 +21,19 @@ EXPECTED_FINDINGS = [
     ("internal-tools-mcp", "MCP_NO_PKCE", "HIGH"),
     ("internal-tools-mcp", "MCP_NO_RESOURCE_INDICATOR", "HIGH"),
     ("internal-tools-mcp", "MCP_WILDCARD_SCOPE", "MEDIUM"),
-    (None, "A2A_CROSS_ORG", "CRITICAL"),       # meridian or zdgavnxdu9
-    (None, "A2A_AUTH_NONE", "CRITICAL"),        # meridian or zdgavnxdu9 (second occurrence)
-    (None, "A2A_WILDCARD_CAPABILITY", "HIGH"),  # meridian or zdgavnxdu9
-    (None, "BEHAVIORAL_EPHEMERAL_SPAWN", "HIGH"),  # optional, from CloudTrail
+    (None, "A2A_CROSS_ORG", "CRITICAL"),               # meridian or zdgavnxdu9
+    (None, "A2A_AUTH_NONE", "CRITICAL"),               # meridian or zdgavnxdu9 (second occurrence)
+    (None, "A2A_WILDCARD_CAPABILITY", "HIGH"),         # meridian or zdgavnxdu9
+    (None, "BEHAVIORAL_EPHEMERAL_SPAWN", "HIGH"),      # optional, from CloudTrail
+    # Phase 11.5 — static reference analysis
+    ("ShadowAnalytics", "MISSING_INTENT_DECLARATION", "MEDIUM"),  # ephemeral/shadow agent with no intent file
+    ("shadow-indexer", "INTENT_MISMATCH", "HIGH"),     # stated intent does not match observed behaviour
 ]
 
-PASS_THRESHOLD = 12
+PASS_THRESHOLD = 14
+
+# Phase 11.5: minimum expected static-reference edges (STATIC_REF or IAM_PERMISSION)
+MIN_STATIC_EDGES = 1
 
 
 def matches(finding, agent_pattern, rule_id, severity):
@@ -91,14 +97,34 @@ def main():
               f"framework={ag.get('framework','') or '-':<15s}  "
               f"visibility={ag.get('visibilityClass','?')}")
 
-    if passed >= PASS_THRESHOLD:
-        print(f"\nPASS: {passed}/{total} findings confirmed (threshold {PASS_THRESHOLD}).")
+    # Phase 11.5: static-reference edge check
+    edges = data.get("edges", [])
+    static_edge_types = {"STATIC_REF", "IAM_PERMISSION"}
+    static_edges = [e for e in edges if e.get("edgeType") in static_edge_types]
+    print(f"\nStatic-reference edges (STATIC_REF / IAM_PERMISSION): {len(static_edges)}")
+    for e in static_edges:
+        print(f"  {e.get('edgeType','?'):16s}  conf={e.get('confidence',0):.2f}  {e.get('evidence','')}")
+    # Specifically look for LeadScorer-Prod → Meridian Data API Gateway IAM_PERMISSION edge
+    lead_meridian = any(
+        e.get("edgeType") == "IAM_PERMISSION" and
+        "execute-api" in e.get("evidence", "").lower()
+        for e in static_edges
+    )
+    print(f"  LeadScorer-Prod → Meridian IAM_PERMISSION edge: {'FOUND' if lead_meridian else 'NOT FOUND (acceptable if demo not run against live AWS)'}")
+
+    edges_ok = len(static_edges) >= MIN_STATIC_EDGES
+
+    if passed >= PASS_THRESHOLD and edges_ok:
+        print(f"\nPASS: {passed}/{total} findings confirmed (threshold {PASS_THRESHOLD}), {len(static_edges)} static edges.")
         sys.exit(0)
     else:
         missing = [desc for matched, desc in results if not matched]
-        print(f"\nFAIL: Only {passed}/{total} findings found. Missing:")
-        for m in missing:
-            print(f"  {m}")
+        if passed < PASS_THRESHOLD:
+            print(f"\nFAIL: Only {passed}/{total} findings found. Missing:")
+            for m in missing:
+                print(f"  {m}")
+        if not edges_ok:
+            print(f"\nFAIL: Only {len(static_edges)}/{MIN_STATIC_EDGES} static-reference edges found.")
         sys.exit(1)
 
 

@@ -23,10 +23,11 @@ type PluginConfig struct {
 
 // ScanResult is returned by a plugin's Scan method.
 type ScanResult struct {
-	Agents   []types.CanonicalAgentRecord
-	Edges    []types.AgentEdgeRecord
-	Events   []types.NormalizedEvent // for chain reconstruction
-	Findings []types.FindingRecord   // plugin-level findings
+	Agents     []types.CanonicalAgentRecord
+	Edges      []types.AgentEdgeRecord
+	Events     []types.NormalizedEvent // for chain reconstruction
+	Findings   []types.FindingRecord   // plugin-level findings
+	StaticRefs []types.StaticRef       // for static reference analysis (Phase 11.5)
 }
 
 // ScanPlugin is the interface every plugin must implement.

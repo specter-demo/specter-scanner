@@ -52,12 +52,14 @@ const (
 type EdgeType string
 
 const (
-	EdgeTypeSTSAssume    EdgeType = "STS_ASSUME"
-	EdgeTypeECSSpawn     EdgeType = "ECS_SPAWN"
-	EdgeTypeOIDCDeploy   EdgeType = "OIDC_DEPLOY"
-	EdgeTypeA2ACall      EdgeType = "A2A_CALL"
-	EdgeTypePartnerAgent EdgeType = "PARTNER_AGENT"
-	EdgeTypeEnvURL       EdgeType = "ENV_URL"
+	EdgeTypeSTSAssume     EdgeType = "STS_ASSUME"
+	EdgeTypeECSSpawn      EdgeType = "ECS_SPAWN"
+	EdgeTypeOIDCDeploy    EdgeType = "OIDC_DEPLOY"
+	EdgeTypeA2ACall       EdgeType = "A2A_CALL"
+	EdgeTypePartnerAgent  EdgeType = "PARTNER_AGENT"
+	EdgeTypeEnvURL        EdgeType = "ENV_URL"
+	EdgeTypeStaticRef     EdgeType = "STATIC_REF"    // statically discovered code reference
+	EdgeTypeIAMPermission EdgeType = "IAM_PERMISSION" // IAM policy grants agent invocation
 )
 
 // A2ACard is the parsed agent card from the A2A protocol.
@@ -188,6 +190,15 @@ type CanonicalAgentRecord struct {
 
 	// Visibility source
 	VisibilitySource string `json:"visibilitySource,omitempty"` // "SCANNER" | "TIER_2"
+
+	// Intent analysis (Phase 11.5 — static reference analysis)
+	IntentStatement  string   `json:"intentStatement,omitempty"`  // first meaningful sentence from intent file
+	IntentSource     string   `json:"intentSource,omitempty"`     // ".specter/manifest.yaml" | "AGENT.md" | "CLAUDE.md" | "README.md"
+	IntentConfidence float64  `json:"intentConfidence,omitempty"` // confidence in the parsed intent
+	AlignmentScore   float64  `json:"alignmentScore,omitempty"`   // 0.0–1.0 intent vs behaviour alignment
+	AlignmentTier    string   `json:"alignmentTier,omitempty"`    // "ALIGNED" | "PARTIAL" | "MISMATCHED" | "UNKNOWN"
+	AlignmentMismatch []string `json:"alignmentMismatch,omitempty"` // specific mismatches found
+	IntentOwner      string   `json:"intentOwner,omitempty"`      // owner declared in intent file
 }
 
 // AgentEdgeRecord represents a relationship between two agents.
@@ -198,6 +209,18 @@ type AgentEdgeRecord struct {
 	Confidence     float64  `json:"confidence"`
 	DiscoveredAt   time.Time `json:"discoveredAt"`
 	Evidence       string    `json:"evidence,omitempty"`
+}
+
+// StaticRef is a reference to another agent/service discovered statically
+// (env vars, IAM policies, or source code). Resolved by the static reference
+// analyser into AgentEdgeRecords or AGENT_UNRESOLVED_DEPENDENCY findings.
+type StaticRef struct {
+	SourceAgentExternalID string   `json:"sourceAgentExternalId"`
+	TargetExternalID      string   `json:"targetExternalId"` // ARN, URL, or other identifier
+	RefSource             string   `json:"refSource"`         // "ENV_VAR" | "IAM_POLICY" | "SOURCE_CODE"
+	EdgeType              EdgeType `json:"edgeType"`          // STATIC_REF or IAM_PERMISSION
+	Confidence            float64  `json:"confidence"`
+	Evidence              string   `json:"evidence,omitempty"`
 }
 
 // NormalizedPermission maps platform-specific actions to normalized ops.

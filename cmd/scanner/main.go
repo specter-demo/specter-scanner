@@ -19,6 +19,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/specter-demo/specter-scanner/internal/analysis/staticref"
 	"github.com/specter-demo/specter-scanner/internal/blast"
 	"github.com/specter-demo/specter-scanner/internal/chain"
 	"github.com/specter-demo/specter-scanner/internal/classify"
@@ -94,6 +95,14 @@ func main() {
 		log.Printf("mcp analysis error: %v", err)
 	}
 	result.Findings = append(result.Findings, mcpFindings...)
+
+	// Step 3: Static reference analysis (Phase 11.5)
+	// Runs after plugins and protocol analyzers so agent records are fully populated,
+	// but before classification so intent/alignment data can inform risk scoring.
+	staticAnalyzer := staticref.New(cfg.OrgID)
+	staticEdges, staticFindings := staticAnalyzer.Analyze(ctx, result.Agents, result.StaticRefs, result.Edges)
+	result.Edges = append(result.Edges, staticEdges...)
+	result.Findings = append(result.Findings, staticFindings...)
 
 	// Classification pass
 	for i := range result.Agents {
@@ -236,16 +245,18 @@ func runScan(ctx context.Context, cfg *config.ScannerConfig, _ string) (*combine
 		combined.Edges = append(combined.Edges, pr.result.Edges...)
 		combined.Events = append(combined.Events, pr.result.Events...)
 		combined.Findings = append(combined.Findings, pr.result.Findings...)
+		combined.StaticRefs = append(combined.StaticRefs, pr.result.StaticRefs...)
 	}
 
 	return combined, nil
 }
 
 type combinedScanResult struct {
-	Agents   []types.CanonicalAgentRecord
-	Edges    []types.AgentEdgeRecord
-	Events   []types.NormalizedEvent
-	Findings []types.FindingRecord
+	Agents     []types.CanonicalAgentRecord
+	Edges      []types.AgentEdgeRecord
+	Events     []types.NormalizedEvent
+	Findings   []types.FindingRecord
+	StaticRefs []types.StaticRef
 }
 
 func computeVisibility(agent *types.CanonicalAgentRecord) types.VisibilityClass {

@@ -121,20 +121,22 @@ func (p *Plugin) Scan(ctx context.Context) (*plugin.ScanResult, error) {
 	result := &plugin.ScanResult{}
 
 	// Step 1: Scan Lambda functions
-	lambdaAgents, lambdaFindings, err := p.scanLambda(ctx)
+	lambdaAgents, lambdaFindings, lambdaRefs, err := p.scanLambda(ctx)
 	if err != nil {
 		log.Printf("aws: lambda scan error: %v", err)
 	}
 	result.Agents = append(result.Agents, lambdaAgents...)
 	result.Findings = append(result.Findings, lambdaFindings...)
+	result.StaticRefs = append(result.StaticRefs, lambdaRefs...)
 
 	// Step 2: Scan ECS services
-	ecsAgents, ecsFindings, err := p.scanECS(ctx)
+	ecsAgents, ecsFindings, ecsRefs, err := p.scanECS(ctx)
 	if err != nil {
 		log.Printf("aws: ecs scan error: %v", err)
 	}
 	result.Agents = append(result.Agents, ecsAgents...)
 	result.Findings = append(result.Findings, ecsFindings...)
+	result.StaticRefs = append(result.StaticRefs, ecsRefs...)
 
 	// Step 4: IAM role provenance for all discovered agents
 	iamFindings, err := p.scanIAMProvenance(ctx, result.Agents)
@@ -181,11 +183,12 @@ func (p *Plugin) Scan(ctx context.Context) (*plugin.ScanResult, error) {
 }
 
 // scanLambda discovers all Lambda functions and builds agent records.
-func (p *Plugin) scanLambda(ctx context.Context) ([]types.CanonicalAgentRecord, []types.FindingRecord, error) {
+func (p *Plugin) scanLambda(ctx context.Context) ([]types.CanonicalAgentRecord, []types.FindingRecord, []types.StaticRef, error) {
 	lambdaClient := lambda.NewFromConfig(p.awsConf)
 
 	var agents []types.CanonicalAgentRecord
 	var findings []types.FindingRecord
+	var refs []types.StaticRef
 	var nextMarker *string
 
 	for {
@@ -193,13 +196,14 @@ func (p *Plugin) scanLambda(ctx context.Context) ([]types.CanonicalAgentRecord, 
 			Marker: nextMarker,
 		})
 		if err != nil {
-			return agents, findings, fmt.Errorf("ListFunctions: %w", err)
+			return agents, findings, refs, fmt.Errorf("ListFunctions: %w", err)
 		}
 
 		for _, fn := range out.Functions {
-			agent, fnFindings := p.buildLambdaAgent(ctx, lambdaClient, aws.ToString(fn.FunctionName))
+			agent, fnFindings, fnRefs := p.buildLambdaAgent(ctx, lambdaClient, aws.ToString(fn.FunctionName))
 			agents = append(agents, agent)
 			findings = append(findings, fnFindings...)
+			refs = append(refs, fnRefs...)
 		}
 
 		if out.NextMarker == nil {
@@ -208,10 +212,10 @@ func (p *Plugin) scanLambda(ctx context.Context) ([]types.CanonicalAgentRecord, 
 		nextMarker = out.NextMarker
 	}
 
-	return agents, findings, nil
+	return agents, findings, refs, nil
 }
 
-func (p *Plugin) buildLambdaAgent(ctx context.Context, client *lambda.Client, name string) (types.CanonicalAgentRecord, []types.FindingRecord) {
+func (p *Plugin) buildLambdaAgent(ctx context.Context, client *lambda.Client, name string) (types.CanonicalAgentRecord, []types.FindingRecord, []types.StaticRef) {
 	var findings []types.FindingRecord
 	now := time.Now().UTC()
 
@@ -221,7 +225,7 @@ func (p *Plugin) buildLambdaAgent(ctx context.Context, client *lambda.Client, na
 	})
 	if err != nil {
 		log.Printf("aws: GetFunction %s: %v", name, err)
-		return types.CanonicalAgentRecord{Name: name, Platform: "AWS_LAMBDA"}, nil
+		return types.CanonicalAgentRecord{Name: name, Platform: "AWS_LAMBDA"}, nil, nil
 	}
 
 	cfg := fnOut.Configuration
@@ -302,6 +306,11 @@ func (p *Plugin) buildLambdaAgent(ctx context.Context, client *lambda.Client, na
 		agent = p.enrichIAMRole(ctx, agent, &findings)
 	}
 
+	// Static reference extraction (Phase 11.5)
+	var refs []types.StaticRef
+	refs = append(refs, extractEnvVarReferences(agent, envVars)...)
+	refs = append(refs, extractIAMPermissionRefs(agent)...)
+
 	// Ownership finding
 	if agent.OwnerTag == "" {
 		evidence, _ := json.Marshal(map[string]string{
@@ -321,7 +330,7 @@ func (p *Plugin) buildLambdaAgent(ctx context.Context, client *lambda.Client, na
 		})
 	}
 
-	return agent, findings
+	return agent, findings, refs
 }
 
 // enrichIAMRole fetches IAM role policies and checks for wildcards inline.
@@ -617,14 +626,15 @@ func isCreatorStillPresent(identity map[string]interface{}, creatorName string, 
 }
 
 // scanECS discovers ECS services and builds agent records.
-func (p *Plugin) scanECS(ctx context.Context) ([]types.CanonicalAgentRecord, []types.FindingRecord, error) {
+func (p *Plugin) scanECS(ctx context.Context) ([]types.CanonicalAgentRecord, []types.FindingRecord, []types.StaticRef, error) {
 	ecsClient := ecssvc.NewFromConfig(p.awsConf)
 	var agents []types.CanonicalAgentRecord
 	var findings []types.FindingRecord
+	var refs []types.StaticRef
 
 	clustersOut, err := ecsClient.ListClusters(ctx, &ecssvc.ListClustersInput{})
 	if err != nil {
-		return nil, nil, fmt.Errorf("ListClusters: %w", err)
+		return nil, nil, nil, fmt.Errorf("ListClusters: %w", err)
 	}
 
 	for _, clusterARN := range clustersOut.ClusterArns {
@@ -666,7 +676,7 @@ func (p *Plugin) scanECS(ctx context.Context) ([]types.CanonicalAgentRecord, []t
 							}
 						}
 
-						agent, svcFindings := p.buildECSServiceAgent(
+						agent, svcFindings, svcRefs := p.buildECSServiceAgent(
 							aws.ToString(svc.ServiceArn),
 							aws.ToString(svc.TaskDefinition),
 							tags,
@@ -675,6 +685,7 @@ func (p *Plugin) scanECS(ctx context.Context) ([]types.CanonicalAgentRecord, []t
 						)
 						agents = append(agents, agent)
 						findings = append(findings, svcFindings...)
+						refs = append(refs, svcRefs...)
 					}
 				}
 			}
@@ -685,10 +696,10 @@ func (p *Plugin) scanECS(ctx context.Context) ([]types.CanonicalAgentRecord, []t
 		}
 	}
 
-	return agents, findings, nil
+	return agents, findings, refs, nil
 }
 
-func (p *Plugin) buildECSServiceAgent(svcArn, taskDefArn string, tags, envVars map[string]string, clusterARN string) (types.CanonicalAgentRecord, []types.FindingRecord) {
+func (p *Plugin) buildECSServiceAgent(svcArn, taskDefArn string, tags, envVars map[string]string, clusterARN string) (types.CanonicalAgentRecord, []types.FindingRecord, []types.StaticRef) {
 	now := time.Now().UTC()
 	var findings []types.FindingRecord
 
@@ -751,8 +762,15 @@ func (p *Plugin) buildECSServiceAgent(svcArn, taskDefArn string, tags, envVars m
 		})
 	}
 
+	// Static reference extraction (Phase 11.5)
+	var refs []types.StaticRef
+	refs = append(refs, extractEnvVarReferences(agent, envVars)...)
+	// ECS task roles are enriched separately via scanIAMProvenance, so IAM refs
+	// can only be extracted if the role is known at this point (often it isn't).
+	refs = append(refs, extractIAMPermissionRefs(agent)...)
+
 	_ = taskDefArn
-	return agent, findings
+	return agent, findings, refs
 }
 
 // maxEventPages caps CloudTrail pagination to prevent very long scans.
@@ -1049,6 +1067,96 @@ func (p *Plugin) detectFrameworkFromEnv(agent types.CanonicalAgentRecord, envVar
 	}
 
 	return agent
+}
+
+// arnPatterns match common AWS resource identifiers that imply an inter-agent dependency.
+var (
+	lambdaARNPattern    = regexp.MustCompile(`arn:aws:lambda:[a-z0-9-]+:\d{12}:function:[a-zA-Z0-9_:-]+`)
+	apiGWARNPattern     = regexp.MustCompile(`arn:aws:execute-api:[a-z0-9-]+:\d{12}:[a-zA-Z0-9]+`)
+	apiGWURLEnvPattern  = regexp.MustCompile(`https://[a-z0-9]+\.execute-api\.[a-z0-9-]+\.amazonaws\.com(?:/[^\s"']*)?`)
+	bedrockARNPattern   = regexp.MustCompile(`arn:aws:bedrock:[a-z0-9-]+:\d{12}:(?:agent|foundation-model|agent-alias)/[a-zA-Z0-9/_.-]+`)
+	functionURLPattern  = regexp.MustCompile(`https://[a-z0-9]+\.lambda-url\.[a-z0-9-]+\.on\.aws(?:/[^\s"']*)?`)
+)
+
+// extractEnvVarReferences scans an agent's environment variables for patterns
+// that imply a static dependency on another agent or service.
+// Confidence is fixed at 0.80 per spec section 4.4.
+func extractEnvVarReferences(agent types.CanonicalAgentRecord, envVars map[string]string) []types.StaticRef {
+	var refs []types.StaticRef
+	skipKeys := regexp.MustCompile(`(?i)(secret|password|token|key|cred)`)
+
+	for k, v := range envVars {
+		if skipKeys.MatchString(k) || len(v) < 10 {
+			continue
+		}
+		var match string
+		var evidence string
+		switch {
+		case lambdaARNPattern.MatchString(v):
+			match = lambdaARNPattern.FindString(v)
+			evidence = fmt.Sprintf("env var %s = %s", k, match)
+		case apiGWARNPattern.MatchString(v):
+			match = apiGWARNPattern.FindString(v)
+			evidence = fmt.Sprintf("env var %s = %s", k, match)
+		case apiGWURLEnvPattern.MatchString(v):
+			match = apiGWURLEnvPattern.FindString(v)
+			evidence = fmt.Sprintf("env var %s = %s", k, match)
+		case bedrockARNPattern.MatchString(v):
+			match = bedrockARNPattern.FindString(v)
+			evidence = fmt.Sprintf("env var %s = %s", k, match)
+		case functionURLPattern.MatchString(v):
+			match = functionURLPattern.FindString(v)
+			evidence = fmt.Sprintf("env var %s = %s", k, match)
+		}
+		if match != "" {
+			refs = append(refs, types.StaticRef{
+				SourceAgentExternalID: agent.ExternalID,
+				TargetExternalID:      match,
+				RefSource:             "ENV_VAR",
+				EdgeType:              types.EdgeTypeStaticRef,
+				Confidence:            0.80,
+				Evidence:              evidence,
+			})
+		}
+	}
+	return refs
+}
+
+// extractIAMPermissionRefs examines the agent's already-populated IAMPermissions
+// for actions that invoke other agents on specific (non-wildcard) resources.
+// Confidence is fixed at 0.90 per spec section 4.4.
+func extractIAMPermissionRefs(agent types.CanonicalAgentRecord) []types.StaticRef {
+	agentInvokeActions := map[string]bool{
+		"lambda:invokefunction": true,
+		"execute-api:invoke":    true,
+		"bedrock:invokeagent":   true,
+		"bedrock:invokemodel":   true,
+	}
+
+	var refs []types.StaticRef
+	seen := map[string]bool{}
+	for _, perm := range agent.IAMPermissions {
+		if perm.ResourceScope == "" || perm.ResourceScope == "*" {
+			continue // skip wildcards per spec
+		}
+		action := strings.ToLower(perm.RawAction)
+		if !agentInvokeActions[action] {
+			continue
+		}
+		if seen[perm.ResourceScope] {
+			continue
+		}
+		seen[perm.ResourceScope] = true
+		refs = append(refs, types.StaticRef{
+			SourceAgentExternalID: agent.ExternalID,
+			TargetExternalID:      perm.ResourceScope,
+			RefSource:             "IAM_POLICY",
+			EdgeType:              types.EdgeTypeIAMPermission,
+			Confidence:            0.90,
+			Evidence:              fmt.Sprintf("IAM policy allows %s on %s", perm.RawAction, perm.ResourceScope),
+		})
+	}
+	return refs
 }
 
 // urlEnvPattern matches env var names that look like external agent/partner URLs.
