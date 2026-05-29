@@ -89,7 +89,10 @@ func (p *Plugin) loadAWSConfig(ctx context.Context) (aws.Config, error) {
 	stsClient := sts.NewFromConfig(baseCfg)
 	creds := stscreds.NewAssumeRoleProvider(stsClient, p.awsCfg.RoleARN,
 		func(o *stscreds.AssumeRoleOptions) {
-			o.ExternalID = aws.String(p.awsCfg.ExternalID)
+			// Only set ExternalID if non-empty — STS rejects empty strings (min length 2).
+			if p.awsCfg.ExternalID != "" {
+				o.ExternalID = aws.String(p.awsCfg.ExternalID)
+			}
 			o.RoleSessionName = "SpecterScanner"
 			o.Duration = 3600 * time.Second
 		},

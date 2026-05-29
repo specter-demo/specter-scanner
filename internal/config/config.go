@@ -8,6 +8,10 @@ import (
 	"time"
 )
 
+// ReadonlyRoleARN returns the cross-account SpecterReadOnly role ARN from the
+// environment. Set via SPECTER_READONLY_ROLE_ARN in cloud-hosted ECS mode.
+func ReadonlyRoleARN() string { return os.Getenv("SPECTER_READONLY_ROLE_ARN") }
+
 // ScannerConfig holds the runtime configuration for the scanner.
 type ScannerConfig struct {
 	// Platform API
