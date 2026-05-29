@@ -168,7 +168,8 @@ func configurePlugins(cfg *config.ScannerConfig) error {
 				"region":         cfg.AWSRegion,
 				// Cross-account role for cloud-hosted scanning.
 				// Empty in standalone mode; set via SPECTER_READONLY_ROLE_ARN in ECS.
-				"roleArn": config.ReadonlyRoleARN(),
+				"roleArn":   config.ReadonlyRoleARN(),
+				"externalId": config.ReadonlyExternalID(),
 			}
 			var err error
 			rawConfig, err = json.Marshal(awsCfg)

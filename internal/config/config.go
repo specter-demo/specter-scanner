@@ -12,6 +12,10 @@ import (
 // environment. Set via SPECTER_READONLY_ROLE_ARN in cloud-hosted ECS mode.
 func ReadonlyRoleARN() string { return os.Getenv("SPECTER_READONLY_ROLE_ARN") }
 
+// ReadonlyExternalID returns the STS ExternalId required by the SpecterReadOnly
+// trust policy. Set via SPECTER_READONLY_EXTERNAL_ID in cloud-hosted ECS mode.
+func ReadonlyExternalID() string { return os.Getenv("SPECTER_READONLY_EXTERNAL_ID") }
+
 // ScannerConfig holds the runtime configuration for the scanner.
 type ScannerConfig struct {
 	// Platform API
