@@ -17,12 +17,7 @@ test:
 	go test ./... -v -timeout 60s
 
 test-demo:
-	AWS_PROFILE=customer-demo go run ./cmd/scanner \
-	  --no-platform \
-	  --output json \
-	  --api-key $${SPECTER_DEMO_API_KEY:-demo} \
-	  --org-slug specter-demo \
-	  | python3 scripts/verify_demo_findings.py
+	bash scripts/run-demo-test.sh
 
 sign:
 	cosign sign-blob --output-signature dist/specter-scanner-linux-amd64.sig dist/specter-scanner-linux-amd64

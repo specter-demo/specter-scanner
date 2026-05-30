@@ -201,7 +201,7 @@ func (p *Plugin) Scan(ctx context.Context) (*plugin.ScanResult, error) {
 		}
 
 		for _, repo := range repos {
-			agent, findings, repoRefs := p.scanRepo(ctx, client, repo)
+			agent, findings, repoRefs := p.scanRepo(ctx, client, repo, p.cfg.SeedAgents)
 			if agent != nil {
 				result.Agents = append(result.Agents, *agent)
 			}
@@ -275,21 +275,29 @@ var (
 	}
 )
 
-func (p *Plugin) scanRepo(ctx context.Context, client *gogithub.Client, repo *gogithub.Repository) (*types.CanonicalAgentRecord, []types.FindingRecord, []types.StaticRef) {
+// scanRepo scans a single repository for agent signals and enriches the
+// matching seed agent (discovered by the AWS plugin in Phase 1).
+//
+// If no seed agent matches the repository name, the repo is silently skipped —
+// the scanner must not create standalone GITHUB-platform agent records.
+// Findings and static refs are attributed to the matched seed agent's
+// stableId and name so they appear on the correct agent in the platform.
+func (p *Plugin) scanRepo(ctx context.Context, client *gogithub.Client, repo *gogithub.Repository, seedAgents []types.CanonicalAgentRecord) (*types.CanonicalAgentRecord, []types.FindingRecord, []types.StaticRef) {
 	now := time.Now().UTC()
 	repoName := repo.GetName()
 	orgName := p.ghCfg.Org
 
-	agentExternalID := fmt.Sprintf("github:%s/%s", orgName, repoName)
-	agent := &types.CanonicalAgentRecord{
-		Name:             orgName + "/" + repoName,
-		Platform:         "GITHUB",
-		ExternalID:       agentExternalID,
-		StableID:         stableID(p.cfg.OrgID, agentExternalID),
-		OrgID:            p.cfg.OrgID,
-		LastSeenAt:       now,
-		VisibilitySource: "SCANNER",
+	// Require a matching seed agent — no standalone GITHUB-platform records.
+	seedAgent := matchSeedAgent(repoName, seedAgents)
+	if seedAgent == nil {
+		return nil, nil, nil
 	}
+
+	// Copy the seed agent; we will enrich this copy with GitHub-sourced data.
+	// Platform, ExternalID, StableID, IAM data, etc. are preserved from AWS.
+	agent := *seedAgent
+	// Use the seed agent's externalID for static ref attribution.
+	agentExternalID := seedAgent.ExternalID
 
 	var findings []types.FindingRecord
 	content := &GitHubRepoContent{}
@@ -371,27 +379,37 @@ func (p *Plugin) scanRepo(ctx context.Context, client *gogithub.Client, repo *go
 		})
 	}
 
-	// Only return agent if it looks like an AI agent repo
+	// Only return an enriched agent if there is actually something new to add.
+	// If the repo has no AI signals, no findings, and no intent declaration, the
+	// seed agent from the AWS phase already has the right data — leave it alone.
 	if agent.Framework == "" && len(findings) == 0 && content.IntentText == "" {
-		return nil, nil, nil
+		return nil, nil, content.SourceRefs
 	}
 
-	// Phase 11.5: apply intent and alignment data
+	// Phase 11.5: apply intent and alignment data.
 	if content.IntentText != "" {
 		agent.IntentStatement = firstSentence(content.IntentText)
 		agent.IntentSource = content.IntentSource
 		agent.IntentOwner = content.IntentOwner
 		agent.IntentConfidence = intentConfidence(content.IntentSource)
 
-		score, mismatches := scoreAlignment(*agent, findings, content.IntentText)
+		// Filter seed edges to only outbound edges from this agent
+		var agentEdges []types.AgentEdgeRecord
+		for _, e := range p.cfg.SeedEdges {
+			if e.SourceStableID == agent.StableID {
+				agentEdges = append(agentEdges, e)
+			}
+		}
+
+		score, tier, mismatches := scoreAlignment(content.IntentText, agent, findings, agentEdges)
 		agent.AlignmentScore = score
 		agent.AlignmentMismatch = mismatches
-		agent.AlignmentTier = alignmentTier(score)
+		agent.AlignmentTier = tier
 	} else {
 		agent.AlignmentTier = "UNKNOWN"
 	}
 
-	return agent, findings, content.SourceRefs
+	return &agent, findings, content.SourceRefs
 }
 
 func (p *Plugin) fetchFileContent(ctx context.Context, client *gogithub.Client, org, repo, path string, dest *string) {
@@ -519,8 +537,25 @@ func detectFrameworkFromManifest(content string) (framework string, confidence f
 
 // ── Phase 11.5: intent declaration ──────────────────────────────────────────
 
+// IntentSource constants — canonical values used in IntentSource field.
+const (
+	IntentSourceManifest = "MANIFEST"
+	IntentSourceAgentMD  = "AGENT_MD"
+	IntentSourceClaudeMD = "CLAUDE_MD"
+	IntentSourceReadme   = "README"
+)
+
 // specterManifest is a partial parse of .specter/manifest.yaml.
+// Supports the nested specter.agent.* schema.
 type specterManifest struct {
+	Specter struct {
+		Agent struct {
+			Intent               string   `yaml:"intent"`
+			Owner                string   `yaml:"owner"`
+			RiskAcknowledgements []string `yaml:"risk_acknowledgements"`
+		} `yaml:"agent"`
+	} `yaml:"specter"`
+	// Legacy flat fields for backward compatibility
 	Name        string `yaml:"name"`
 	Description string `yaml:"description"`
 	Owner       string `yaml:"owner"`
@@ -529,16 +564,27 @@ type specterManifest struct {
 // extractIntentDeclaration looks for intent files in priority order:
 // .specter/manifest.yaml → AGENT.md → CLAUDE.md → README.md
 func (p *Plugin) extractIntentDeclaration(ctx context.Context, client *gogithub.Client, org, repo string, content *GitHubRepoContent) {
-	// Priority 1: .specter/manifest.yaml
+	// Priority 1: .specter/manifest.yaml — nested specter.agent.intent schema
 	var manifestTxt string
 	p.fetchFileContent(ctx, client, org, repo, ".specter/manifest.yaml", &manifestTxt)
 	if manifestTxt != "" {
 		var m specterManifest
-		if err := yaml.Unmarshal([]byte(manifestTxt), &m); err == nil && m.Description != "" {
-			content.IntentText = m.Description
-			content.IntentSource = ".specter/manifest.yaml"
-			content.IntentOwner = m.Owner
-			return
+		if err := yaml.Unmarshal([]byte(manifestTxt), &m); err == nil {
+			intent := m.Specter.Agent.Intent
+			owner := m.Specter.Agent.Owner
+			// Fall back to legacy flat fields
+			if intent == "" {
+				intent = m.Description
+			}
+			if owner == "" {
+				owner = m.Owner
+			}
+			if intent != "" {
+				content.IntentText = truncate(intent, 500)
+				content.IntentSource = IntentSourceManifest
+				content.IntentOwner = owner
+				return
+			}
 		}
 	}
 
@@ -546,8 +592,8 @@ func (p *Plugin) extractIntentDeclaration(ctx context.Context, client *gogithub.
 	var agentMD string
 	p.fetchFileContent(ctx, client, org, repo, "AGENT.md", &agentMD)
 	if agentMD != "" {
-		content.IntentText = agentMD
-		content.IntentSource = "AGENT.md"
+		content.IntentText = extractMarkdownIntent(agentMD)
+		content.IntentSource = IntentSourceAgentMD
 		content.IntentOwner = extractOwnerFromMarkdown(agentMD)
 		return
 	}
@@ -556,41 +602,160 @@ func (p *Plugin) extractIntentDeclaration(ctx context.Context, client *gogithub.
 	var claudeMD string
 	p.fetchFileContent(ctx, client, org, repo, "CLAUDE.md", &claudeMD)
 	if claudeMD != "" {
-		content.IntentText = claudeMD
-		content.IntentSource = "CLAUDE.md"
+		content.IntentText = extractMarkdownIntent(claudeMD)
+		content.IntentSource = IntentSourceClaudeMD
 		content.IntentOwner = extractOwnerFromMarkdown(claudeMD)
 		return
 	}
 
-	// Priority 4: README.md
+	// Priority 4: README.md — only use if it has at least 50 words (substantive)
 	var readmeMD string
 	p.fetchFileContent(ctx, client, org, repo, "README.md", &readmeMD)
-	if readmeMD != "" {
-		content.IntentText = readmeMD
-		content.IntentSource = "README.md"
+	if readmeMD != "" && wordCount(readmeMD) >= 50 {
+		content.IntentText = extractMarkdownIntent(readmeMD)
+		content.IntentSource = IntentSourceReadme
 		content.IntentOwner = extractOwnerFromMarkdown(readmeMD)
 	}
 }
 
-// extractOwnerFromMarkdown looks for "Owner:" or "Maintainer:" declarations.
+// extractMarkdownIntent extracts the most relevant intent paragraph from a
+// markdown document, capped at 500 characters.
+//
+// Search order:
+//  1. First non-empty paragraph under a recognised intent heading
+//     (## Purpose, ## Overview, ## What this agent does, ## About)
+//  2. First non-empty paragraph after the H1 title
+//  3. First substantive non-heading paragraph anywhere in the document
+func extractMarkdownIntent(text string) string {
+	lines := strings.Split(text, "\n")
+	intentHeadings := map[string]bool{
+		"## purpose":              true,
+		"## overview":             true,
+		"## what this agent does": true,
+		"## about":                true,
+		"## description":          true,
+	}
+
+	// Pass 1: look for content under a recognised intent heading
+	for i, line := range lines {
+		norm := strings.ToLower(strings.TrimSpace(line))
+		if intentHeadings[norm] {
+			para := firstSubstantiveParagraph(lines[i+1:])
+			if para != "" {
+				return truncate(para, 500)
+			}
+		}
+	}
+
+	// Pass 2: first paragraph after the H1 title
+	for i, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "# ") && !strings.HasPrefix(trimmed, "## ") {
+			para := firstSubstantiveParagraph(lines[i+1:])
+			if para != "" {
+				return truncate(para, 500)
+			}
+		}
+	}
+
+	// Pass 3: first substantive paragraph anywhere
+	para := firstSubstantiveParagraph(lines)
+	return truncate(para, 500)
+}
+
+// firstSubstantiveParagraph returns the first paragraph from lines that has
+// at least 10 characters and is not a markdown heading or horizontal rule.
+func firstSubstantiveParagraph(lines []string) string {
+	var buf []string
+	inParagraph := false
+
+	for _, rawLine := range lines {
+		line := strings.TrimSpace(rawLine)
+		isHeading := strings.HasPrefix(line, "#")
+		isRule := strings.HasPrefix(line, "---") || strings.HasPrefix(line, "===")
+		isCode := strings.HasPrefix(line, "```") || strings.HasPrefix(line, "    ")
+		isBadge := strings.Contains(line, "[![") || strings.Contains(line, "![")
+
+		if line == "" {
+			if inParagraph && len(buf) > 0 {
+				break // end of paragraph
+			}
+			continue
+		}
+		if isHeading || isRule || isCode || isBadge {
+			if inParagraph {
+				break
+			}
+			continue
+		}
+		// Strip markdown markup for cleaner text
+		cleaned := stripMarkdown(line)
+		if len(cleaned) < 5 {
+			continue
+		}
+		buf = append(buf, cleaned)
+		inParagraph = true
+	}
+
+	result := strings.Join(buf, " ")
+	if len(result) < 10 {
+		return ""
+	}
+	return result
+}
+
+// stripMarkdown removes inline markdown from a line (bold, italic, links, code).
+var reMarkdownStrip = regexp.MustCompile(`\[([^\]]+)\]\([^\)]+\)|[*_` + "`" + `]`)
+
+func stripMarkdown(line string) string {
+	// Replace [text](url) links with just the text
+	line = regexp.MustCompile(`\[([^\]]+)\]\([^\)]+\)`).ReplaceAllString(line, "$1")
+	// Remove remaining markdown punctuation
+	line = regexp.MustCompile(`[*_` + "`" + `]`).ReplaceAllString(line, "")
+	return strings.TrimSpace(line)
+}
+
+// extractOwnerFromMarkdown looks for ownership signals in markdown text:
+//  1. "Owner:", "Maintainer:", "Contact:" label on a line
+//  2. Email addresses near "maintained by", "owned by", "contact" keywords
 func extractOwnerFromMarkdown(text string) string {
-	ownerPat := regexp.MustCompile(`(?im)^(?:Owner|Maintainer|Contact):\s*(.+)$`)
-	if m := ownerPat.FindStringSubmatch(text); len(m) > 1 {
+	// Pattern 1: labelled field
+	labelPat := regexp.MustCompile(`(?im)^(?:Owner|Maintainer|Contact|Owned by|Maintained by):\s*(.+)$`)
+	if m := labelPat.FindStringSubmatch(text); len(m) > 1 {
 		return strings.TrimSpace(m[1])
 	}
+
+	// Pattern 2: email near ownership keywords
+	emailPat := regexp.MustCompile(`[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}`)
+	ownershipPat := regexp.MustCompile(`(?i)(maintained by|owned by|contact|owner|maintainer)`)
+
+	lower := strings.ToLower(text)
+	for _, line := range strings.Split(lower, "\n") {
+		if ownershipPat.MatchString(line) {
+			// Find an email in the original-case line at the same position
+			for _, rawLine := range strings.Split(text, "\n") {
+				if strings.EqualFold(strings.TrimSpace(rawLine), strings.TrimSpace(line)) {
+					if email := emailPat.FindString(rawLine); email != "" {
+						return email
+					}
+				}
+			}
+		}
+	}
+
 	return ""
 }
 
 // intentConfidence maps the intent source to a confidence score.
 func intentConfidence(source string) float64 {
 	switch source {
-	case ".specter/manifest.yaml":
+	case IntentSourceManifest:
 		return 0.98
-	case "AGENT.md":
+	case IntentSourceAgentMD:
 		return 0.90
-	case "CLAUDE.md":
+	case IntentSourceClaudeMD:
 		return 0.85
-	case "README.md":
+	case IntentSourceReadme:
 		return 0.60 // README may describe the repo, not just the agent
 	}
 	return 0.50
@@ -604,13 +769,11 @@ func firstSentence(text string) string {
 		if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, "---") {
 			continue
 		}
-		// Strip markdown bold/italic/inline code markers
-		line = regexp.MustCompile(`[*_` + "`" + `]`).ReplaceAllString(line, "")
+		line = stripMarkdown(line)
 		line = strings.TrimSpace(line)
 		if len(line) < 10 {
 			continue
 		}
-		// Trim to the first sentence (end at . ! ?)
 		if idx := strings.IndexAny(line, ".!?"); idx > 0 {
 			return line[:idx+1]
 		}
@@ -622,67 +785,111 @@ func firstSentence(text string) string {
 // ── Phase 11.5: alignment scoring ──────────────────────────────────────────
 
 // scoreAlignment computes how well an agent's stated intent matches its observed
-// behaviour. Returns a score (0.0–1.0) and a slice of specific mismatches found.
-func scoreAlignment(agent types.CanonicalAgentRecord, findings []types.FindingRecord, intentText string) (float64, []string) {
-	score := 1.0
-	var mismatches []string
+// behaviour. Returns a score (0.0–1.0), a tier string, and a slice of mismatches.
+//
+// Signals checked:
+//  1. "read-only", "analytics", "reporting" in intent → penalise if IAM has
+//     write/delete/put actions or wildcard resource permissions.
+//  2. "standalone", "independent" in intent → penalise if outbound A2A_CALL
+//     or STATIC_REF edges exist (agent delegates to other agents).
+//  3. "worker", "subprocess" in intent → penalise if IAM grants ecs:RunTask
+//     or lambda:InvokeFunction (worker that can spawn tasks is an orchestrator).
+//
+// agentEdges must be pre-filtered to only the edges whose SourceStableID
+// matches the agent being scored (outbound edges only).
+func scoreAlignment(
+	intentText string,
+	agent types.CanonicalAgentRecord,
+	findings []types.FindingRecord,
+	agentEdges []types.AgentEdgeRecord,
+) (score float64, tier string, mismatches []string) {
+	if intentText == "" {
+		return 0.0, "UNKNOWN", nil
+	}
+
+	score = 1.0
 	lower := strings.ToLower(intentText)
 
-	// Build a set of finding rule IDs for quick lookup
+	// Build finding rule set for quick lookup
 	findingRules := map[string]bool{}
 	for _, f := range findings {
 		findingRules[f.RuleID] = true
 	}
 
-	// Intent claims security/auth but agent has no-auth endpoints
-	if containsAny(lower, "secure", "authenticated", "private", "internal only", "authorized") {
-		if findingRules["A2A_AUTH_NONE"] || findingRules["LAMBDA_PUBLIC_URL_NO_AUTH"] {
-			score -= 0.35
-			mismatches = append(mismatches, "intent claims authenticated access but agent has unauthenticated public endpoints")
+	// ── Signal 1: read-only / analytics intent vs write IAM permissions ──────
+	if containsAny(lower, "read-only", "readonly", "analytics", "reporting", "read only", "view only", "monitoring", "indexing") {
+		wroteIAMMismatch := false
+		for _, perm := range agent.IAMPermissions {
+			raw := strings.ToLower(perm.RawAction)
+			if strings.Contains(raw, "put") || strings.Contains(raw, "delete") ||
+				strings.Contains(raw, "write") || strings.Contains(raw, "create") ||
+				strings.Contains(raw, "update") {
+				score -= 0.30
+				mismatches = append(mismatches, fmt.Sprintf(
+					"intent claims read-only/analytics role but IAM grants write action %s", perm.RawAction))
+				wroteIAMMismatch = true
+				break
+			}
 		}
-		if findingRules["GITHUB_STATIC_AWS_CREDS"] {
-			score -= 0.15
-			mismatches = append(mismatches, "intent claims secure operation but workflow uses static credentials")
+		if !wroteIAMMismatch && agent.HasWildcard {
+			score -= 0.20
+			mismatches = append(mismatches, "intent claims read-only/analytics scope but IAM role has wildcard resource permissions")
 		}
 	}
 
-	// Intent claims read-only but agent has write/mutation permissions
-	if containsAny(lower, "read-only", "readonly", "read only", "view only", "non-destructive") {
-		for _, perm := range agent.IAMPermissions {
-			if perm.RawAction == "s3:PutObject" || perm.RawAction == "s3:DeleteObject" ||
-				strings.Contains(strings.ToLower(perm.RawAction), "put") ||
-				strings.Contains(strings.ToLower(perm.RawAction), "write") ||
-				strings.Contains(strings.ToLower(perm.RawAction), "delete") {
+	// ── Signal 2: standalone / independent intent vs outbound delegation edges ─
+	if containsAny(lower, "standalone", "independent", "self-contained", "no external") {
+		for _, e := range agentEdges {
+			if e.EdgeType == types.EdgeTypeA2ACall || e.EdgeType == types.EdgeTypeStaticRef {
 				score -= 0.25
-				mismatches = append(mismatches, fmt.Sprintf("intent claims read-only but IAM grants %s", perm.RawAction))
+				mismatches = append(mismatches, fmt.Sprintf(
+					"intent claims standalone/independent but agent has outbound %s edge to %s",
+					e.EdgeType, e.TargetStableID))
 				break
 			}
 		}
 	}
 
-	// Intent claims narrow scope but agent has wildcard permissions
-	if agent.HasWildcard && containsAny(lower, "limited", "scoped", "least privilege", "narrow") {
-		score -= 0.20
-		mismatches = append(mismatches, "intent claims limited scope but IAM role has wildcard resource permissions")
+	// ── Signal 3: worker intent vs orchestration IAM permissions ─────────────
+	if containsAny(lower, "worker", "subprocess", "sub-agent", "leaf") {
+		for _, perm := range agent.IAMPermissions {
+			raw := strings.ToLower(perm.RawAction)
+			if raw == "ecs:runtask" || raw == "lambda:invokefunction" {
+				score -= 0.25
+				mismatches = append(mismatches, fmt.Sprintf(
+					"intent claims worker role but IAM grants orchestration action %s", perm.RawAction))
+				break
+			}
+		}
 	}
 
-	// Intent claims internal/private but agent has committed secrets
+	// ── Carry-over: security claims vs unauthenticated findings ───────────────
+	if containsAny(lower, "secure", "authenticated", "private", "internal only", "authorized") {
+		if findingRules["A2A_AUTH_NONE"] || findingRules["LAMBDA_PUBLIC_URL_NO_AUTH"] {
+			score -= 0.20
+			mismatches = append(mismatches, "intent claims authenticated access but agent has unauthenticated public endpoints")
+		}
+	}
+
+	// ── Carry-over: committed secret vs any stated security posture ───────────
 	if findingRules["GITHUB_COMMITTED_SECRET"] {
-		score -= 0.20
-		mismatches = append(mismatches, "secret committed to repository undermines stated security posture")
-	}
-
-	// Intent mentions orchestration but functional class is WORKER
-	if containsAny(lower, "orchestrat", "coordinate", "delegates to", "manages agents") &&
-		agent.FunctionalClass == types.FunctionalClassWorker {
 		score -= 0.15
-		mismatches = append(mismatches, "intent claims orchestration role but agent is classified as WORKER")
+		mismatches = append(mismatches, "secret committed to repository undermines stated security posture")
 	}
 
 	if score < 0.0 {
 		score = 0.0
 	}
-	return score, mismatches
+
+	switch {
+	case score >= 0.80:
+		tier = "ALIGNED"
+	case score >= 0.60:
+		tier = "PARTIAL"
+	default:
+		tier = "MISMATCHED"
+	}
+	return
 }
 
 func containsAny(s string, substrs ...string) bool {
@@ -692,20 +899,6 @@ func containsAny(s string, substrs ...string) bool {
 		}
 	}
 	return false
-}
-
-// alignmentTier maps a score to a tier label.
-func alignmentTier(score float64) string {
-	switch {
-	case score >= 0.80:
-		return "ALIGNED"
-	case score >= 0.60:
-		return "PARTIAL"
-	case score > 0.0:
-		return "MISMATCHED"
-	default:
-		return "MISMATCHED"
-	}
 }
 
 // ── Phase 11.5: source code reference extraction ────────────────────────────
@@ -813,6 +1006,54 @@ func wordCount(s string) int {
 func stableID(orgID, externalID string) string {
 	h := sha256.Sum256([]byte(orgID + "|" + externalID))
 	return hex.EncodeToString(h[:])[:16]
+}
+
+// normalizeName returns a lowercase, alphanumeric-only version of s, suitable
+// for fuzzy name matching between repo names and agent names.
+func normalizeName(s string) string {
+	s = strings.ToLower(s)
+	var b strings.Builder
+	for _, r := range s {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
+}
+
+// matchSeedAgent finds the seed agent that corresponds to repoName.
+//
+// Matching strategy (in priority order):
+//  1. Exact normalized match: normalizeName(agent.Name) == normalizeName(repoName)
+//  2. Prefix match: agent name starts with the repo name (handles
+//     "CustomerInsight-Orchestrator" vs repo "customer-insight").
+//
+// Returns nil if no seed agent matches — the repo should be skipped entirely.
+func matchSeedAgent(repoName string, seedAgents []types.CanonicalAgentRecord) *types.CanonicalAgentRecord {
+	if len(seedAgents) == 0 {
+		return nil
+	}
+	repoNorm := normalizeName(repoName)
+
+	// Pass 1: exact normalized match.
+	for i := range seedAgents {
+		if normalizeName(seedAgents[i].Name) == repoNorm {
+			return &seedAgents[i]
+		}
+	}
+
+	// Pass 2: seed agent normalized name starts with repo normalized name.
+	// Minimum 5 chars to avoid spurious short-prefix matches.
+	if len(repoNorm) >= 5 {
+		for i := range seedAgents {
+			seedNorm := normalizeName(seedAgents[i].Name)
+			if strings.HasPrefix(seedNorm, repoNorm) {
+				return &seedAgents[i]
+			}
+		}
+	}
+
+	return nil
 }
 
 func truncate(s string, n int) string {

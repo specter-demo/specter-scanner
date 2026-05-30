@@ -19,6 +19,18 @@ type PluginConfig struct {
 	OrgSlug    string
 	PluginType string
 	RawConfig  []byte // decrypted plugin-specific config from platform
+
+	// SeedAgents is the set of agents already discovered by earlier plugins in the
+	// same scan. The GitHub plugin uses this to match repositories to known agents
+	// and enrich them, rather than creating standalone GITHUB-platform records.
+	// Populated by runScan() after Phase 1 (non-GitHub) plugins complete.
+	SeedAgents []types.CanonicalAgentRecord
+
+	// SeedEdges is the set of edges already discovered by earlier plugins in the
+	// same scan. The GitHub plugin uses these to check for outbound A2A and
+	// STATIC_REF edges when computing behavioral alignment scores.
+	// Populated by runScan() after Phase 1 (non-GitHub) plugins complete.
+	SeedEdges []types.AgentEdgeRecord
 }
 
 // ScanResult is returned by a plugin's Scan method.

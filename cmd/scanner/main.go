@@ -200,56 +200,125 @@ func configurePlugins(cfg *config.ScannerConfig) error {
 	return nil
 }
 
+// runScan executes plugins in two sequential phases so that the GitHub plugin
+// can enrich agents that were already discovered by Phase 1 (e.g., AWS) rather
+// than creating duplicate GITHUB-platform records.
+//
+// Phase 1: all non-GitHub plugins run in parallel.
+// Phase 2: the GitHub plugin is reconfigured with Phase 1 agents as SeedAgents,
+// then run. Its returned agents are merged back into the Phase 1 set (in-place
+// update by stableId) rather than appended, preventing duplicates.
 func runScan(ctx context.Context, cfg *config.ScannerConfig, _ string) (*combinedScanResult, error) {
-	var activePlugins []plugin.ScanPlugin
+	var allPlugins []plugin.ScanPlugin
 	if cfg.PluginFilter != "" {
 		p, err := plugin.Get(cfg.PluginFilter)
 		if err != nil {
 			return nil, fmt.Errorf("plugin %q not found", cfg.PluginFilter)
 		}
-		activePlugins = []plugin.ScanPlugin{p}
+		allPlugins = []plugin.ScanPlugin{p}
 	} else {
-		activePlugins = plugin.All()
+		allPlugins = plugin.All()
+	}
+
+	// Separate GitHub plugin from the rest.
+	var phase1Plugins []plugin.ScanPlugin
+	var githubPlugin plugin.ScanPlugin
+	for _, p := range allPlugins {
+		if p.Name() == "github" {
+			githubPlugin = p
+		} else {
+			phase1Plugins = append(phase1Plugins, p)
+		}
 	}
 
 	type pluginResult struct {
-		name     string
-		result   *plugin.ScanResult
-		err      error
+		name   string
+		result *plugin.ScanResult
+		err    error
 	}
-
-	resultCh := make(chan pluginResult, len(activePlugins))
-	var wg sync.WaitGroup
-
-	for _, p := range activePlugins {
-		wg.Add(1)
-		go func(p plugin.ScanPlugin) {
-			defer wg.Done()
-			log.Printf("plugin %s: starting scan", p.Name())
-			start := time.Now()
-			r, err := p.Scan(ctx)
-			log.Printf("plugin %s: done in %v", p.Name(), time.Since(start))
-			resultCh <- pluginResult{name: p.Name(), result: r, err: err}
-		}(p)
-	}
-
-	wg.Wait()
-	close(resultCh)
 
 	combined := &combinedScanResult{}
-	for pr := range resultCh {
-		if pr.err != nil {
-			log.Printf("plugin %s error: %v", pr.name, pr.err)
-			continue
+
+	// ── Phase 1: non-GitHub plugins in parallel ──────────────────────────────
+	if len(phase1Plugins) > 0 {
+		resultCh := make(chan pluginResult, len(phase1Plugins))
+		var wg sync.WaitGroup
+		for _, p := range phase1Plugins {
+			wg.Add(1)
+			go func(p plugin.ScanPlugin) {
+				defer wg.Done()
+				log.Printf("plugin %s: starting scan", p.Name())
+				start := time.Now()
+				r, err := p.Scan(ctx)
+				log.Printf("plugin %s: done in %v", p.Name(), time.Since(start))
+				resultCh <- pluginResult{name: p.Name(), result: r, err: err}
+			}(p)
 		}
-		if pr.result == nil {
-			continue
+		wg.Wait()
+		close(resultCh)
+		for pr := range resultCh {
+			if pr.err != nil {
+				log.Printf("plugin %s error: %v", pr.name, pr.err)
+				continue
+			}
+			if pr.result == nil {
+				continue
+			}
+			combined.Agents = append(combined.Agents, pr.result.Agents...)
+			combined.Edges = append(combined.Edges, pr.result.Edges...)
+			combined.Events = append(combined.Events, pr.result.Events...)
+			combined.Findings = append(combined.Findings, pr.result.Findings...)
+			combined.StaticRefs = append(combined.StaticRefs, pr.result.StaticRefs...)
 		}
-		combined.Agents = append(combined.Agents, pr.result.Agents...)
-		combined.Edges = append(combined.Edges, pr.result.Edges...)
-		combined.Events = append(combined.Events, pr.result.Events...)
-		combined.Findings = append(combined.Findings, pr.result.Findings...)
-		combined.StaticRefs = append(combined.StaticRefs, pr.result.StaticRefs...)
+	}
+
+	// ── Phase 2: GitHub plugin with seed agents from Phase 1 ─────────────────
+	if githubPlugin != nil {
+		ghRawCfg, err := json.Marshal(map[string]interface{}{
+			"token": cfg.GitHubToken,
+			"org":   cfg.GitHubOrg,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("marshal github config for phase 2: %w", err)
+		}
+		if err := githubPlugin.Configure(plugin.PluginConfig{
+			OrgID:      cfg.OrgID,
+			OrgSlug:    cfg.OrgSlug,
+			PluginType: "github",
+			RawConfig:  ghRawCfg,
+			SeedAgents: combined.Agents, // agents discovered in Phase 1
+			SeedEdges:  combined.Edges,  // edges discovered in Phase 1 (for alignment scoring)
+		}); err != nil {
+			log.Printf("plugin github: reconfigure error: %v", err)
+		} else {
+			log.Printf("plugin github: starting scan")
+			start := time.Now()
+			r, err := githubPlugin.Scan(ctx)
+			log.Printf("plugin github: done in %v", time.Since(start))
+			if err != nil {
+				log.Printf("plugin github error: %v", err)
+			} else if r != nil {
+				// Enrich Phase 1 agents in-place with GitHub data (intent, alignment,
+				// framework). The GitHub plugin returns copies of matched seed agents
+				// with enriched fields; we replace the Phase 1 record by stableId.
+				// We do NOT append them as new agents to avoid duplicate records.
+				if len(r.Agents) > 0 {
+					ghByStableID := make(map[string]types.CanonicalAgentRecord, len(r.Agents))
+					for _, a := range r.Agents {
+						ghByStableID[a.StableID] = a
+					}
+					for i := range combined.Agents {
+						if enriched, ok := ghByStableID[combined.Agents[i].StableID]; ok {
+							combined.Agents[i] = enriched
+						}
+					}
+				}
+				combined.Edges = append(combined.Edges, r.Edges...)
+				combined.Events = append(combined.Events, r.Events...)
+				combined.Findings = append(combined.Findings, r.Findings...)
+				combined.StaticRefs = append(combined.StaticRefs, r.StaticRefs...)
+			}
+		}
 	}
 
 	return combined, nil

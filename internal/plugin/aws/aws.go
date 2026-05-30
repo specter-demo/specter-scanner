@@ -972,15 +972,48 @@ func findParentFromSTSEvents(burstEvents, allEvents []types.NormalizedEvent) str
 }
 
 // discoverExternalAgents creates synthetic agent records from env URL vars.
+//
+// Before creating a new record, it checks whether an already-discovered agent
+// already covers the URL (matching by hostname or exact externalId). If found,
+// the edge points to the existing agent rather than creating a duplicate record.
+// This prevents seed agents like "Meridian Data (Partner)" — whose externalId is
+// the raw hostname — from being shadowed by a second "external:https://…" record.
 func (p *Plugin) discoverExternalAgents(agents []types.CanonicalAgentRecord) ([]types.CanonicalAgentRecord, []types.AgentEdgeRecord) {
 	now := time.Now().UTC()
 	var externalAgents []types.CanonicalAgentRecord
 	var edges []types.AgentEdgeRecord
 	seen := map[string]bool{}
 
+	// Build lookup: hostname → existing agent stableId, for dedup.
+	// Also index by exact externalId (without scheme/prefix) for fallback.
+	existingByHost := map[string]string{} // hostname → stableId
+	for _, a := range agents {
+		if u, err := url.Parse("https://" + a.ExternalID); err == nil && u.Hostname() != "" {
+			existingByHost[u.Hostname()] = a.StableID
+		}
+		// Exact externalId index (handles "hostname.example.com" matching "https://hostname.example.com")
+		existingByHost[a.ExternalID] = a.StableID
+	}
+
 	for _, agent := range agents {
 		for envKey, rawURL := range agent.EnvExternalURLs {
-			targetID := stableID(p.cfg.OrgID, "external:"+rawURL)
+			u, err := url.Parse(rawURL)
+			if err != nil {
+				continue
+			}
+			hostname := u.Hostname()
+
+			// Check if an existing (seed) agent already represents this endpoint.
+			var targetID string
+			if existingStableID, ok := existingByHost[hostname]; ok {
+				// Route the edge to the existing agent — no new record needed.
+				targetID = existingStableID
+			} else if existingStableID, ok := existingByHost[rawURL]; ok {
+				targetID = existingStableID
+			} else {
+				targetID = stableID(p.cfg.OrgID, "external:"+rawURL)
+			}
+
 			if seen[rawURL] {
 				edges = append(edges, types.AgentEdgeRecord{
 					SourceStableID: agent.StableID,
@@ -994,25 +1027,25 @@ func (p *Plugin) discoverExternalAgents(agents []types.CanonicalAgentRecord) ([]
 			}
 			seen[rawURL] = true
 
-			u, err := url.Parse(rawURL)
-			if err != nil {
-				continue
+			// Only create a new external agent if no existing agent covers this URL.
+			if _, matched := existingByHost[hostname]; !matched {
+				if _, matchedURL := existingByHost[rawURL]; !matchedURL {
+					extName := hostname
+					extID := "external:" + rawURL
+					externalAgent := types.CanonicalAgentRecord{
+						Name:             extName,
+						Platform:         "EXTERNAL_HTTP",
+						ExternalID:       extID,
+						StableID:         targetID,
+						OrgID:            p.cfg.OrgID,
+						PublicURL:        rawURL,
+						A2ACardURL:       strings.TrimRight(rawURL, "/") + "/.well-known/agent-card.json",
+						LastSeenAt:       now,
+						VisibilitySource: "SCANNER",
+					}
+					externalAgents = append(externalAgents, externalAgent)
+				}
 			}
-			extName := u.Hostname()
-			extID := "external:" + rawURL
-
-			externalAgent := types.CanonicalAgentRecord{
-				Name:             extName,
-				Platform:         "EXTERNAL_HTTP",
-				ExternalID:       extID,
-				StableID:         targetID,
-				OrgID:            p.cfg.OrgID,
-				PublicURL:        rawURL,
-				A2ACardURL:       strings.TrimRight(rawURL, "/") + "/.well-known/agent-card.json",
-				LastSeenAt:       now,
-				VisibilitySource: "SCANNER",
-			}
-			externalAgents = append(externalAgents, externalAgent)
 
 			edges = append(edges, types.AgentEdgeRecord{
 				SourceStableID: agent.StableID,
