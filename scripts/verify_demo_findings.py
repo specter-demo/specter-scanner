@@ -46,10 +46,7 @@ PASS_THRESHOLD = 11   # out of 15.
 # With those 3 excluded, 12 findings are reachable; threshold 11 gives one buffer.
 
 # Mandatory independent checks (not in EXPECTED_FINDINGS threshold)
-# In --no-platform mode the scanner discovers only AWS-deployed agents.
-# BedrockAgent-Compliance and ShadowAnalytics-7f2a are not running as live AWS
-# resources in the demo account, so the discoverable count is 7.
-EXPECTED_AGENT_COUNT = 7
+EXPECTED_AGENT_COUNT = 9
 MIN_MISSING_INTENT_AGENTS = 2   # MISSING_INTENT_DECLARATION on at least 2 distinct agents
 MIN_STATIC_EDGES = 1
 

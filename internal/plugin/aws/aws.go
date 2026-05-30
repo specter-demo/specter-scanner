@@ -18,6 +18,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awscfg "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials/stscreds"
+	"github.com/aws/aws-sdk-go-v2/service/bedrockagent"
 	"github.com/aws/aws-sdk-go-v2/service/cloudtrail"
 	cloudtrailtypes "github.com/aws/aws-sdk-go-v2/service/cloudtrail/types"
 	ecssvc "github.com/aws/aws-sdk-go-v2/service/ecs"
@@ -140,6 +141,14 @@ func (p *Plugin) Scan(ctx context.Context) (*plugin.ScanResult, error) {
 	result.Agents = append(result.Agents, ecsAgents...)
 	result.Findings = append(result.Findings, ecsFindings...)
 	result.StaticRefs = append(result.StaticRefs, ecsRefs...)
+
+	// Step 3: Scan Bedrock agents
+	bedrockAgents, bedrockFindings, err := p.scanBedrock(ctx)
+	if err != nil {
+		log.Printf("aws: bedrock scan error: %v", err)
+	}
+	result.Agents = append(result.Agents, bedrockAgents...)
+	result.Findings = append(result.Findings, bedrockFindings...)
 
 	// Step 4: IAM role provenance for all discovered agents
 	iamFindings, err := p.scanIAMProvenance(ctx, result.Agents)
@@ -626,6 +635,83 @@ func isCreatorStillPresent(identity map[string]interface{}, creatorName string, 
 	default:
 		return false
 	}
+}
+
+// scanBedrock discovers Amazon Bedrock agents and builds canonical agent records.
+// It calls ListAgents (paginated), fetches tags for each agent, and emits a
+// NHI_ORPHANED_CREATOR finding when the specter:owner tag is absent (shadow agent).
+func (p *Plugin) scanBedrock(ctx context.Context) ([]types.CanonicalAgentRecord, []types.FindingRecord, error) {
+	client := bedrockagent.NewFromConfig(p.awsConf)
+	now := time.Now().UTC()
+
+	var agents []types.CanonicalAgentRecord
+	var findings []types.FindingRecord
+	var nextToken *string
+
+	for {
+		out, err := client.ListAgents(ctx, &bedrockagent.ListAgentsInput{
+			MaxResults: aws.Int32(100),
+			NextToken:  nextToken,
+		})
+		if err != nil {
+			return agents, findings, fmt.Errorf("ListAgents: %w", err)
+		}
+
+		for _, summary := range out.AgentSummaries {
+			agentID := aws.ToString(summary.AgentId)
+			name := aws.ToString(summary.AgentName)
+			agentARN := fmt.Sprintf("arn:aws:bedrock:%s:%s:agent/%s",
+				p.awsConf.Region, p.cfg.OrgID, agentID)
+
+			// Fetch tags
+			tagsOut, err := client.ListTagsForResource(ctx, &bedrockagent.ListTagsForResourceInput{
+				ResourceArn: aws.String(agentARN),
+			})
+			tags := map[string]string{}
+			if err == nil {
+				tags = tagsOut.Tags
+			}
+
+			agent := types.CanonicalAgentRecord{
+				Name:          name,
+				Platform:      "AWS_BEDROCK",
+				ExternalID:    agentARN,
+				StableID:      stableID(p.cfg.OrgID, agentARN),
+				AgentClassTag: tags["specter:agent-class"],
+				OwnerTag:      tags["specter:owner"],
+				LastSeenAt:    now,
+			}
+
+			// Missing owner tag → shadow / governance gap
+			if agent.OwnerTag == "" {
+				evidence, _ := json.Marshal(map[string]string{
+					"agentId":  agentID,
+					"agentArn": agentARN,
+				})
+				findings = append(findings, types.FindingRecord{
+					RuleID:        "NHI_ORPHANED_CREATOR",
+					Severity:      "CRITICAL",
+					AgentStableID: agent.StableID,
+					AgentName:     agent.Name,
+					Title:         "Bedrock agent has no owner tag",
+					Description:   fmt.Sprintf("Bedrock agent %s has no specter:owner tag — ownership cannot be determined.", name),
+					EvidenceJSON:  evidence,
+					DiscoveredAt:  now,
+					Plugin:        "aws",
+				})
+			}
+
+			agents = append(agents, agent)
+		}
+
+		if out.NextToken == nil {
+			break
+		}
+		nextToken = out.NextToken
+	}
+
+	log.Printf("aws: bedrock scan found %d agent(s)", len(agents))
+	return agents, findings, nil
 }
 
 // scanECS discovers ECS services and builds agent records.
