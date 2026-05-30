@@ -5,11 +5,20 @@ package github
 
 import (
 	"context"
+	gocrypto "crypto"
+	"crypto/rand"
+	"crypto/rsa"
 	"crypto/sha256"
+	"crypto/x509"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"encoding/pem"
 	"fmt"
+	"io"
 	"log"
+	"net/http"
+	"os"
 	"regexp"
 	"strings"
 	"time"
@@ -57,12 +66,99 @@ func (p *Plugin) Configure(cfg plugin.PluginConfig) error {
 }
 
 func (p *Plugin) buildClient(ctx context.Context) (*gogithub.Client, error) {
-	if p.ghCfg.Token == "" {
-		return nil, fmt.Errorf("github: no token configured (set GITHUB_TOKEN)")
+	token, err := getGitHubToken()
+	if err != nil {
+		return nil, err
 	}
-	ts := oauth2.StaticTokenSource(&oauth2.Token{AccessToken: p.ghCfg.Token})
+	ts := oauth2.StaticTokenSource(&oauth2.Token{AccessToken: token})
 	tc := oauth2.NewClient(ctx, ts)
 	return gogithub.NewClient(tc), nil
+}
+
+// getGitHubToken returns an access token for the GitHub API.
+// Prefers GitHub App auth if GITHUB_APP_ID, GITHUB_APP_PRIVATE_KEY, and
+// GITHUB_APP_INSTALLATION_ID are all set; falls back to GITHUB_TOKEN (PAT).
+func getGitHubToken() (string, error) {
+	appID := os.Getenv("GITHUB_APP_ID")
+	privateKey := os.Getenv("GITHUB_APP_PRIVATE_KEY")
+	installationID := os.Getenv("GITHUB_APP_INSTALLATION_ID")
+
+	if appID != "" && privateKey != "" && installationID != "" {
+		return generateInstallationToken(appID, privateKey, installationID)
+	}
+	token := os.Getenv("GITHUB_TOKEN")
+	if token == "" {
+		return "", fmt.Errorf("no GitHub credentials: set GITHUB_APP_ID+GITHUB_APP_PRIVATE_KEY+GITHUB_APP_INSTALLATION_ID or GITHUB_TOKEN")
+	}
+	return token, nil
+}
+
+// generateInstallationToken exchanges a GitHub App private key for a short-lived
+// installation access token via JWT → POST /app/installations/{id}/access_tokens.
+// Uses only stdlib crypto — no heavy JWT library dependency.
+func generateInstallationToken(appID, privateKeyPEM, installationID string) (string, error) {
+	// 1. Parse RSA private key from PEM
+	block, _ := pem.Decode([]byte(privateKeyPEM))
+	if block == nil {
+		return "", fmt.Errorf("github app: failed to decode PEM block from private key")
+	}
+	key, err := x509.ParsePKCS1PrivateKey(block.Bytes)
+	if err != nil {
+		return "", fmt.Errorf("github app: parse private key: %w", err)
+	}
+
+	// 2. Build RS256 JWT: base64url(header).base64url(payload)
+	now := time.Now().Unix()
+	headerJSON, _ := json.Marshal(map[string]string{"alg": "RS256", "typ": "JWT"})
+	payloadJSON, _ := json.Marshal(map[string]interface{}{
+		"iat": now - 60,  // issued 60s ago to allow clock skew
+		"exp": now + 600, // valid 10 minutes
+		"iss": appID,
+	})
+
+	header := base64.RawURLEncoding.EncodeToString(headerJSON)
+	payload := base64.RawURLEncoding.EncodeToString(payloadJSON)
+	signingInput := header + "." + payload
+
+	digest := sha256.Sum256([]byte(signingInput))
+	sig, err := rsa.SignPKCS1v15(rand.Reader, key, gocrypto.SHA256, digest[:])
+	if err != nil {
+		return "", fmt.Errorf("github app: sign JWT: %w", err)
+	}
+	jwt := signingInput + "." + base64.RawURLEncoding.EncodeToString(sig)
+
+	// 3. POST /app/installations/{id}/access_tokens with JWT as Bearer
+	url := fmt.Sprintf("https://api.github.com/app/installations/%s/access_tokens", installationID)
+	req, err := http.NewRequest(http.MethodPost, url, nil)
+	if err != nil {
+		return "", fmt.Errorf("github app: build request: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+jwt)
+	req.Header.Set("Accept", "application/vnd.github+json")
+	req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
+
+	httpClient := &http.Client{Timeout: 15 * time.Second}
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("github app: request installation token: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusCreated {
+		return "", fmt.Errorf("github app: installations API returned %d: %s", resp.StatusCode, string(body))
+	}
+
+	var result struct {
+		Token string `json:"token"`
+	}
+	if err := json.Unmarshal(body, &result); err != nil {
+		return "", fmt.Errorf("github app: parse token response: %w", err)
+	}
+	if result.Token == "" {
+		return "", fmt.Errorf("github app: empty token in response")
+	}
+	return result.Token, nil
 }
 
 func (p *Plugin) HealthCheck(ctx context.Context) error {
@@ -75,8 +171,10 @@ func (p *Plugin) HealthCheck(ctx context.Context) error {
 }
 
 func (p *Plugin) Scan(ctx context.Context) (*plugin.ScanResult, error) {
-	if p.ghCfg.Token == "" {
-		log.Printf("github: GITHUB_TOKEN not set, skipping GitHub scan")
+	// Check whether any GitHub credentials are available before building client.
+	// This avoids a hard error in environments where GitHub scanning is disabled.
+	if os.Getenv("GITHUB_APP_ID") == "" && os.Getenv("GITHUB_TOKEN") == "" && p.ghCfg.Token == "" {
+		log.Printf("github: no credentials configured (set GITHUB_APP_ID+... or GITHUB_TOKEN), skipping")
 		return &plugin.ScanResult{}, nil
 	}
 

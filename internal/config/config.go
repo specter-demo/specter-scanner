@@ -75,8 +75,13 @@ func Parse() *ScannerConfig {
 		cfg.GitHubToken = os.Getenv("GITHUB_TOKEN")
 	}
 
-	// Use api-key as org ID in standalone mode
-	cfg.OrgID = cfg.APIKey
+	// OrgID for stableId computation must match the platform's real org ID.
+	// In cloud-hosted ECS mode, set SPECTER_ORG_ID to the platform org's UUID.
+	// Falls back to the API key for backward-compat in standalone mode.
+	cfg.OrgID = os.Getenv("SPECTER_ORG_ID")
+	if cfg.OrgID == "" {
+		cfg.OrgID = cfg.APIKey
+	}
 	if cfg.OrgID == "" {
 		cfg.OrgID = "demo-org"
 	}
