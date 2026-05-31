@@ -40,6 +40,10 @@ if [ -z "${GITHUB_APP_ID:-}" ] && aws sts get-caller-identity --profile platform
 fi
 
 # ── Run scanner ───────────────────────────────────────────────────────────────
+# Extend PATH to pick up Homebrew Go on macOS developer machines.
+export PATH="/opt/homebrew/bin:/usr/local/go/bin:$PATH"
+GO="${GO:-go}"
+
 AWS_PROFILE=customer-demo $GO run ./cmd/scanner \
     --no-platform \
     --output json \
