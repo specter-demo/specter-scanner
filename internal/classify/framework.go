@@ -1,3 +1,6 @@
+// Copyright 2026 Specter Systems Inc.
+// SPDX-License-Identifier: Apache-2.0
+
 // Package classify implements agent classification: framework detection,
 // orchestrator classification, risk scoring, and ephemeral detection.
 package classify

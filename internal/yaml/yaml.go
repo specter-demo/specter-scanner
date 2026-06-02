@@ -1,3 +1,6 @@
+// Copyright 2026 Specter Systems Inc.
+// SPDX-License-Identifier: Apache-2.0
+
 // Package yaml implements the YAML agent import format (spec section 10).
 // It parses specter-agent-import.yaml into []CanonicalAgentRecord.
 package yaml

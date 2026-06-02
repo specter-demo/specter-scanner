@@ -1,3 +1,6 @@
+// Copyright 2026 Specter Systems Inc.
+// SPDX-License-Identifier: Apache-2.0
+
 // Package staticref implements the static reference analyser (Phase 11.5).
 //
 // It resolves statically-discovered references (env vars, IAM policies, source

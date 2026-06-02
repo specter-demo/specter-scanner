@@ -1,3 +1,6 @@
+// Copyright 2026 Specter Systems Inc.
+// SPDX-License-Identifier: Apache-2.0
+
 // Package github implements the GitHub scanner plugin.
 // It scans repositories in a GitHub organization for agent code,
 // committed secrets, and workflow credential hygiene.

@@ -1,3 +1,6 @@
+// Copyright 2026 Specter Systems Inc.
+// SPDX-License-Identifier: Apache-2.0
+
 // Package plugin defines the ScanPlugin interface and ActivityStreamAdapter.
 // All plugin implementations live in internal/plugin/<name>/.
 package plugin

@@ -1,3 +1,6 @@
+// Copyright 2026 Specter Systems Inc.
+// SPDX-License-Identifier: Apache-2.0
+
 // Package types defines all shared data structures used across the specter-scanner.
 // These types form the ingest contract between the scanner and the platform.
 package types

@@ -1,3 +1,6 @@
+// Copyright 2026 Specter Systems Inc.
+// SPDX-License-Identifier: Apache-2.0
+
 // Package main is the Specter AI Agent governance scanner entry point.
 // It wires together all plugins, protocol analyzers, and classification passes,
 // then either writes a JSON/HTML report to stdout (--no-platform) or posts

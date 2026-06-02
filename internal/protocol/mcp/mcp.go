@@ -1,3 +1,6 @@
+// Copyright 2026 Specter Systems Inc.
+// SPDX-License-Identifier: Apache-2.0
+
 // Package mcp implements the MCP protocol analyzer (spec 2025-06-18).
 // It checks MCP server agents for OAuth, PKCE, resource indicator,
 // and scope configuration issues.

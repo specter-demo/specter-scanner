@@ -1,3 +1,6 @@
+// Copyright 2026 Specter Systems Inc.
+// SPDX-License-Identifier: Apache-2.0
+
 // Package ingest assembles scan payloads and computes HMAC signatures
 // for posting to the Specter platform (spec section 11).
 package ingest

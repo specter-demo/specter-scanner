@@ -1,3 +1,6 @@
+// Copyright 2026 Specter Systems Inc.
+// SPDX-License-Identifier: Apache-2.0
+
 // Package sdk provides exported types for third-party plugin authors.
 // It re-exports the key types from internal/plugin and internal/types.
 package sdk

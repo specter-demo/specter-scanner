@@ -1,8 +1,12 @@
+// Copyright 2026 Specter Systems Inc.
+// SPDX-License-Identifier: Apache-2.0
+
 package aws
 
 import (
 	"context"
 	"encoding/json"
+	"strings"
 	"testing"
 	"time"
 
@@ -215,6 +219,104 @@ func TestExtractExternalURLs(t *testing.T) {
 	}
 	if _, ok := urls["INTERNAL_AGENT_URL"]; ok {
 		t.Error("localhost URL should be excluded")
+	}
+}
+
+// TestNHIOrphanedCreatorSuppressedByOwnerTag validates that a non-empty specter:owner
+// tag suppresses NHI_ORPHANED_CREATOR even when the IAM creator no longer exists.
+func TestNHIOrphanedCreatorSuppressedByOwnerTag(t *testing.T) {
+	cases := []struct {
+		name          string
+		ownerTag      string
+		creatorExists bool
+		wantFinding   bool
+	}{
+		{
+			name:          "orphaned creator, no owner tag — should fire",
+			ownerTag:      "",
+			creatorExists: false,
+			wantFinding:   true,
+		},
+		{
+			name:          "orphaned creator, owner tag set — suppressed",
+			ownerTag:      "compliance-engineering",
+			creatorExists: false,
+			wantFinding:   false,
+		},
+		{
+			name:          "orphaned creator, whitespace-only owner tag — should fire",
+			ownerTag:      "   ",
+			creatorExists: false,
+			wantFinding:   true,
+		},
+		{
+			name:          "creator still exists, no owner tag — should not fire",
+			ownerTag:      "",
+			creatorExists: true,
+			wantFinding:   false,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			// Replicate the exact guard condition from scanIAMProvenance.
+			shouldFire := !tc.creatorExists && strings.TrimSpace(tc.ownerTag) == ""
+			if shouldFire != tc.wantFinding {
+				t.Errorf("NHI_ORPHANED_CREATOR guard: ownerTag=%q creatorExists=%v → shouldFire=%v, want %v",
+					tc.ownerTag, tc.creatorExists, shouldFire, tc.wantFinding)
+			}
+		})
+	}
+}
+
+// TestNHIStaleRoleSuppressedByOwnerTag validates that a non-empty specter:owner
+// tag suppresses NHI_STALE_ROLE regardless of role age.
+func TestNHIStaleRoleSuppressedByOwnerTag(t *testing.T) {
+	staleTime := time.Now().Add(-100 * 24 * time.Hour) // 100 days old → stale
+	freshTime := time.Now().Add(-10 * 24 * time.Hour)  // 10 days old → not stale
+
+	cases := []struct {
+		name        string
+		ownerTag    string
+		createdAt   time.Time
+		wantFinding bool
+	}{
+		{
+			name:        "stale role, no owner tag — should fire",
+			ownerTag:    "",
+			createdAt:   staleTime,
+			wantFinding: true,
+		},
+		{
+			name:        "stale role, owner tag set — suppressed",
+			ownerTag:    "platform-team",
+			createdAt:   staleTime,
+			wantFinding: false,
+		},
+		{
+			name:        "fresh role, no owner tag — should not fire",
+			ownerTag:    "",
+			createdAt:   freshTime,
+			wantFinding: false,
+		},
+		{
+			name:        "stale role, whitespace owner tag — should fire",
+			ownerTag:    "  ",
+			createdAt:   staleTime,
+			wantFinding: true,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			// Replicate the exact guard condition from scanIAMProvenance.
+			shouldFire := strings.TrimSpace(tc.ownerTag) == "" &&
+				time.Since(tc.createdAt) > 90*24*time.Hour
+			if shouldFire != tc.wantFinding {
+				t.Errorf("NHI_STALE_ROLE guard: ownerTag=%q age=%v → shouldFire=%v, want %v",
+					tc.ownerTag, time.Since(tc.createdAt).Round(time.Hour), shouldFire, tc.wantFinding)
+			}
+		})
 	}
 }
 

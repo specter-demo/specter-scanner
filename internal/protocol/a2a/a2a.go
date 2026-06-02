@@ -1,3 +1,6 @@
+// Copyright 2026 Specter Systems Inc.
+// SPDX-License-Identifier: Apache-2.0
+
 // Package a2a implements the A2A protocol analyzer.
 // It probes /.well-known/agent-card.json on agents with A2ACardURL set.
 package a2a

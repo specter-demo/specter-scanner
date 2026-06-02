@@ -1,3 +1,6 @@
+// Copyright 2026 Specter Systems Inc.
+// SPDX-License-Identifier: Apache-2.0
+
 // Package aws implements the AWS scanner plugin.
 // It scans Lambda, ECS, IAM, and CloudTrail surfaces using the
 // SpecterReadOnly cross-account role (or the current AWS session in standalone mode).
@@ -529,7 +532,10 @@ func (p *Plugin) scanIAMProvenance(ctx context.Context, agents []types.Canonical
 		creatorName := extractCreatorName(identity)
 		creatorExists := isCreatorStillPresent(identity, creatorName, currentUsers)
 
-		if !creatorExists {
+		// NHI_ORPHANED_CREATOR: skip entirely if a declared owner exists.
+		// A specter:owner tag means a human has accepted accountability —
+		// the IAM creator's current status is irrelevant.
+		if !creatorExists && strings.TrimSpace(agent.OwnerTag) == "" {
 			evidence, _ := json.Marshal(map[string]interface{}{
 				"roleArn":       agent.IAMRoleARN,
 				"creatorType":   identity["type"],
@@ -537,6 +543,7 @@ func (p *Plugin) scanIAMProvenance(ctx context.Context, agents []types.Canonical
 				"creatorName":   creatorName,
 				"createdAt":     ctEvent.EventTime,
 				"creatorStatus": "not_found_in_account",
+				"ownerTag":      "absent",
 			})
 			findings = append(findings, types.FindingRecord{
 				RuleID:        "NHI_ORPHANED_CREATOR",
@@ -544,15 +551,19 @@ func (p *Plugin) scanIAMProvenance(ctx context.Context, agents []types.Canonical
 				AgentStableID: agent.StableID,
 				AgentName:     agent.Name,
 				Title:         "IAM role created by identity no longer in account",
-				Description:   fmt.Sprintf("The IAM role %s was created by %s (%v) which no longer has a persistent IAM identity in this account.", agent.IAMRoleARN, creatorName, identity["type"]),
-				EvidenceJSON:  evidence,
-				DiscoveredAt:  now,
-				Plugin:        "aws",
+				Description: fmt.Sprintf(
+					"The IAM role %s was created by %s (%v) which no longer has a persistent IAM identity in this account, "+
+						"and no specter:owner tag has been declared. There is no accountable owner.",
+					agent.IAMRoleARN, creatorName, identity["type"]),
+				EvidenceJSON: evidence,
+				DiscoveredAt: now,
+				Plugin:       "aws",
 			})
 		}
 
-		// NHI_STALE_ROLE: role older than 90 days
-		if agent.IAMRoleCreatedAt != nil && time.Since(*agent.IAMRoleCreatedAt) > 90*24*time.Hour {
+		// NHI_STALE_ROLE: role older than 90 days.
+		// Suppressed when specter:owner is set — a declared owner accepts the risk.
+		if strings.TrimSpace(agent.OwnerTag) == "" && agent.IAMRoleCreatedAt != nil && time.Since(*agent.IAMRoleCreatedAt) > 90*24*time.Hour {
 			evidence, _ := json.Marshal(map[string]interface{}{
 				"roleArn":   agent.IAMRoleARN,
 				"createdAt": agent.IAMRoleCreatedAt,
@@ -644,6 +655,17 @@ func (p *Plugin) scanBedrock(ctx context.Context) ([]types.CanonicalAgentRecord,
 	client := bedrockagent.NewFromConfig(p.awsConf)
 	now := time.Now().UTC()
 
+	// Resolve the real AWS account ID for constructing valid tag-fetch ARNs.
+	// ListAgents only returns agent IDs/names, so we must synthesise the ARN ourselves.
+	// The ExternalID stored in the DB uses p.cfg.OrgID for backward compatibility;
+	// for the ListTagsForResource call we need the numeric account ID.
+	realAccountID := p.cfg.OrgID // fallback to orgId if STS call fails
+	if stsOut, err := sts.NewFromConfig(p.awsConf).GetCallerIdentity(ctx, &sts.GetCallerIdentityInput{}); err == nil {
+		if id := aws.ToString(stsOut.Account); id != "" {
+			realAccountID = id
+		}
+	}
+
 	var agents []types.CanonicalAgentRecord
 	var findings []types.FindingRecord
 	var nextToken *string
@@ -660,12 +682,17 @@ func (p *Plugin) scanBedrock(ctx context.Context) ([]types.CanonicalAgentRecord,
 		for _, summary := range out.AgentSummaries {
 			agentID := aws.ToString(summary.AgentId)
 			name := aws.ToString(summary.AgentName)
+			// agentARN uses p.cfg.OrgID so ExternalID/StableID stay stable across scans
+			// (backward-compatible with existing DB records).
 			agentARN := fmt.Sprintf("arn:aws:bedrock:%s:%s:agent/%s",
 				p.awsConf.Region, p.cfg.OrgID, agentID)
+			// tagsARN uses the real numeric account ID — required for a valid AWS API call.
+			tagsARN := fmt.Sprintf("arn:aws:bedrock:%s:%s:agent/%s",
+				p.awsConf.Region, realAccountID, agentID)
 
-			// Fetch tags
+			// Fetch tags using the real ARN
 			tagsOut, err := client.ListTagsForResource(ctx, &bedrockagent.ListTagsForResourceInput{
-				ResourceArn: aws.String(agentARN),
+				ResourceArn: aws.String(tagsARN),
 			})
 			tags := map[string]string{}
 			if err == nil {
