@@ -68,7 +68,14 @@ func main() {
 		os.Exit(1)
 	}
 
-	scanID := uuid.New().String()
+	// In platform mode, use the scan ID pre-created by the platform so that
+	// phase updates land on the right record. Fall back to a new UUID in
+	// standalone mode (--no-platform) or when the env var is absent.
+	scanID := os.Getenv("SPECTER_SCAN_ID")
+	if scanID == "" {
+		scanID = uuid.New().String()
+	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
 
@@ -77,13 +84,33 @@ func main() {
 		log.Fatalf("configure plugins: %v", err)
 	}
 
-	// Run scan
+	// ── Phase: AWS_DISCOVERY ─────────────────────────────────────────────────
+	postPhaseUpdate(cfg, scanID, "AWS_DISCOVERY", "RUNNING", "Discovering agents in AWS", 0, 0, 0)
+	phaseStart := time.Now()
 	result, err := runScan(ctx, cfg, scanID)
 	if err != nil {
+		postPhaseUpdate(cfg, scanID, "AWS_DISCOVERY", "FAILED", err.Error(), 0, 0, int(time.Since(phaseStart).Milliseconds()))
 		log.Fatalf("scan failed: %v", err)
 	}
+	postPhaseUpdate(cfg, scanID, "AWS_DISCOVERY", "COMPLETE", "", len(result.Agents), len(result.Findings), int(time.Since(phaseStart).Milliseconds()))
 
-	// Protocol analysis (A2A + MCP)
+	if checkCancelled(cfg, scanID) {
+		log.Printf("Scan %s cancelled by user after AWS_DISCOVERY", scanID)
+		os.Exit(0)
+	}
+
+	// ── Phase: GITHUB_ENRICHMENT — already executed inside runScan Phase 2 ──
+	// runScan posts its own GITHUB_ENRICHMENT updates; nothing to do here.
+
+	if checkCancelled(cfg, scanID) {
+		log.Printf("Scan %s cancelled by user after GITHUB_ENRICHMENT", scanID)
+		os.Exit(0)
+	}
+
+	// ── Phase: PROTOCOL_ANALYSIS ─────────────────────────────────────────────
+	postPhaseUpdate(cfg, scanID, "PROTOCOL_ANALYSIS", "RUNNING", "Probing A2A and MCP endpoints", 0, 0, 0)
+	phaseStart = time.Now()
+
 	a2aAnalyzer := a2a.New(scanID, cfg.RateLimit)
 	mcpAnalyzer := mcp.New()
 
@@ -99,9 +126,18 @@ func main() {
 	}
 	result.Findings = append(result.Findings, mcpFindings...)
 
-	// Step 3: Static reference analysis (Phase 11.5)
-	// Runs after plugins and protocol analyzers so agent records are fully populated,
-	// but before classification so intent/alignment data can inform risk scoring.
+	postPhaseUpdate(cfg, scanID, "PROTOCOL_ANALYSIS", "COMPLETE", "", 0, len(a2aFindings)+len(mcpFindings), int(time.Since(phaseStart).Milliseconds()))
+
+	if checkCancelled(cfg, scanID) {
+		log.Printf("Scan %s cancelled by user after PROTOCOL_ANALYSIS", scanID)
+		os.Exit(0)
+	}
+
+	// ── Phase: CLASSIFICATION ────────────────────────────────────────────────
+	postPhaseUpdate(cfg, scanID, "CLASSIFICATION", "RUNNING", "Classifying agents and computing risk", 0, 0, 0)
+	phaseStart = time.Now()
+
+	// Static reference analysis
 	staticAnalyzer := staticref.New(cfg.OrgID)
 	staticEdges, staticFindings := staticAnalyzer.Analyze(ctx, result.Agents, result.StaticRefs, result.Edges)
 	result.Edges = append(result.Edges, staticEdges...)
@@ -110,18 +146,10 @@ func main() {
 	// Classification pass
 	for i := range result.Agents {
 		agent := &result.Agents[i]
-
-		// Framework detection (combine layers)
 		*agent = classify.DetectFramework(*agent, nil)
-
-		// Functional class from edge degrees
 		agent.FunctionalClass = classify.ClassifyFunctional(agent, result.Edges)
-
-		// Visibility class
 		agent.VisibilityClass = computeVisibility(agent)
 		agent.IsShadow = agent.VisibilityClass == types.VisibilityClassShadow
-
-		// Risk score
 		agent.RiskScore = classify.ComputeRiskScore(agent, result.Edges)
 	}
 
@@ -130,6 +158,8 @@ func main() {
 
 	// Delegation chain reconstruction
 	chains := chain.Reconstruct(result.Agents, result.Edges, result.Events)
+
+	postPhaseUpdate(cfg, scanID, "CLASSIFICATION", "COMPLETE", "", len(result.Agents), len(result.Findings), int(time.Since(phaseStart).Milliseconds()))
 
 	// Assemble payload
 	payload := ingest.Assemble(
@@ -150,11 +180,93 @@ func main() {
 		return
 	}
 
-	// Post to platform
+	// ── Phase: POSTING ───────────────────────────────────────────────────────
+	postPhaseUpdate(cfg, scanID, "POSTING", "RUNNING", "Sending results to platform", 0, 0, 0)
+	phaseStart = time.Now()
+
 	if err := postToplatform(ctx, cfg, payload); err != nil {
+		postPhaseUpdate(cfg, scanID, "POSTING", "FAILED", err.Error(), 0, 0, int(time.Since(phaseStart).Milliseconds()))
 		log.Fatalf("post to platform: %v", err)
 	}
+
+	postPhaseUpdate(cfg, scanID, "POSTING", "COMPLETE", "", len(result.Agents), len(result.Findings), int(time.Since(phaseStart).Milliseconds()))
 	log.Printf("Scan %s posted to platform. %d agents, %d findings.", scanID, len(result.Agents), len(result.Findings))
+}
+
+// postPhaseUpdate sends a phase progress update to the platform.
+// In standalone mode (cfg.NoPlatform) or when no scanID is set, it is a no-op.
+func postPhaseUpdate(cfg *config.ScannerConfig, scanID, phase, status, message string, agentsFound, findingsFound, durationMs int) {
+	if cfg.NoPlatform || cfg.PlatformURL == "" || cfg.APIKey == "" || scanID == "" {
+		return
+	}
+
+	body := map[string]interface{}{
+		"phase":        phase,
+		"status":       status,
+		"message":      message,
+		"agentsFound":  agentsFound,
+		"findingsFound": findingsFound,
+		"durationMs":   durationMs,
+	}
+	data, err := json.Marshal(body)
+	if err != nil {
+		log.Printf("postPhaseUpdate: marshal error: %v", err)
+		return
+	}
+
+	url := fmt.Sprintf("%s/api/v1/scans/%s/progress", cfg.PlatformURL, scanID)
+	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(data))
+	if err != nil {
+		log.Printf("postPhaseUpdate: build request error: %v", err)
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+cfg.APIKey)
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		log.Printf("postPhaseUpdate: request error: %v", err)
+		return
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 256))
+		log.Printf("postPhaseUpdate: platform returned %d: %s", resp.StatusCode, string(b))
+	}
+}
+
+// checkCancelled polls the platform for the current scan status and returns
+// true if the scan has been cancelled by the user. In standalone mode or when
+// no scan ID is set, it always returns false.
+func checkCancelled(cfg *config.ScannerConfig, scanID string) bool {
+	if cfg.NoPlatform || cfg.PlatformURL == "" || cfg.APIKey == "" || scanID == "" {
+		return false
+	}
+
+	url := fmt.Sprintf("%s/api/v1/scans/%s/status", cfg.PlatformURL, scanID)
+	req, err := http.NewRequest(http.MethodGet, url, nil)
+	if err != nil {
+		log.Printf("checkCancelled: build request error: %v", err)
+		return false
+	}
+	req.Header.Set("Authorization", "Bearer "+cfg.APIKey)
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		log.Printf("checkCancelled: request error: %v", err)
+		return false
+	}
+	defer resp.Body.Close()
+
+	var result struct {
+		Status string `json:"status"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return false
+	}
+	return result.Status == "CANCELLED"
 }
 
 func configurePlugins(cfg *config.ScannerConfig) error {
@@ -211,7 +323,7 @@ func configurePlugins(cfg *config.ScannerConfig) error {
 // Phase 2: the GitHub plugin is reconfigured with Phase 1 agents as SeedAgents,
 // then run. Its returned agents are merged back into the Phase 1 set (in-place
 // update by stableId) rather than appended, preventing duplicates.
-func runScan(ctx context.Context, cfg *config.ScannerConfig, _ string) (*combinedScanResult, error) {
+func runScan(ctx context.Context, cfg *config.ScannerConfig, scanID string) (*combinedScanResult, error) {
 	var allPlugins []plugin.ScanPlugin
 	if cfg.PluginFilter != "" {
 		p, err := plugin.Get(cfg.PluginFilter)
@@ -277,6 +389,9 @@ func runScan(ctx context.Context, cfg *config.ScannerConfig, _ string) (*combine
 
 	// ── Phase 2: GitHub plugin with seed agents from Phase 1 ─────────────────
 	if githubPlugin != nil {
+		postPhaseUpdate(cfg, scanID, "GITHUB_ENRICHMENT", "RUNNING", "Enriching agents with GitHub data", 0, 0, 0)
+		ghPhaseStart := time.Now()
+
 		ghRawCfg, err := json.Marshal(map[string]interface{}{
 			"token": cfg.GitHubToken,
 			"org":   cfg.GitHubOrg,
@@ -293,6 +408,7 @@ func runScan(ctx context.Context, cfg *config.ScannerConfig, _ string) (*combine
 			SeedEdges:  combined.Edges,  // edges discovered in Phase 1 (for alignment scoring)
 		}); err != nil {
 			log.Printf("plugin github: reconfigure error: %v", err)
+			postPhaseUpdate(cfg, scanID, "GITHUB_ENRICHMENT", "FAILED", err.Error(), 0, 0, int(time.Since(ghPhaseStart).Milliseconds()))
 		} else {
 			log.Printf("plugin github: starting scan")
 			start := time.Now()
@@ -300,6 +416,7 @@ func runScan(ctx context.Context, cfg *config.ScannerConfig, _ string) (*combine
 			log.Printf("plugin github: done in %v", time.Since(start))
 			if err != nil {
 				log.Printf("plugin github error: %v", err)
+				postPhaseUpdate(cfg, scanID, "GITHUB_ENRICHMENT", "FAILED", err.Error(), 0, len(combined.Findings), int(time.Since(ghPhaseStart).Milliseconds()))
 			} else if r != nil {
 				// Enrich Phase 1 agents in-place with GitHub data (intent, alignment,
 				// framework). The GitHub plugin returns copies of matched seed agents
@@ -320,6 +437,10 @@ func runScan(ctx context.Context, cfg *config.ScannerConfig, _ string) (*combine
 				combined.Events = append(combined.Events, r.Events...)
 				combined.Findings = append(combined.Findings, r.Findings...)
 				combined.StaticRefs = append(combined.StaticRefs, r.StaticRefs...)
+				postPhaseUpdate(cfg, scanID, "GITHUB_ENRICHMENT", "COMPLETE", "", len(combined.Agents), len(combined.Findings), int(time.Since(ghPhaseStart).Milliseconds()))
+			} else {
+				// r is nil — no GitHub data, phase still completes successfully
+				postPhaseUpdate(cfg, scanID, "GITHUB_ENRICHMENT", "COMPLETE", "No GitHub repositories found", len(combined.Agents), 0, int(time.Since(ghPhaseStart).Milliseconds()))
 			}
 		}
 	}
