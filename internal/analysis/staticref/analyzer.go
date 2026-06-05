@@ -270,5 +270,11 @@ func isAIAgent(ag *types.CanonicalAgentRecord) bool {
 	if ag.Platform == "GITHUB" {
 		return true // GitHub plugin only emits agents if they look like AI repos
 	}
+	// Managed AI platforms are always AI agents by definition
+	switch ag.Platform {
+	case "AWS_BEDROCK", "AWS_BEDROCK_AGENTCORE", "AZURE_FOUNDRY", "GCP_VERTEX",
+		"LANGSMITH_DEPLOYMENT", "MCP":
+		return true
+	}
 	return false
 }

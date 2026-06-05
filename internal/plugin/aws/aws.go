@@ -699,15 +699,26 @@ func (p *Plugin) scanBedrock(ctx context.Context) ([]types.CanonicalAgentRecord,
 				tags = tagsOut.Tags
 			}
 
-			agent := types.CanonicalAgentRecord{
-				Name:          name,
-				Platform:      "AWS_BEDROCK",
-				ExternalID:    agentARN,
-				StableID:      stableID(p.cfg.OrgID, agentARN),
-				AgentClassTag: tags["specter:agent-class"],
-				OwnerTag:      tags["specter:owner"],
-				LastSeenAt:    now,
+			intentTag := tags["specter:intent"]
+			intentSource := ""
+			if intentTag != "" {
+				intentSource = "aws:tag"
 			}
+
+			agent := types.CanonicalAgentRecord{
+				Name:            name,
+				Platform:        "AWS_BEDROCK",
+				ExternalID:      agentARN,
+				StableID:        stableID(p.cfg.OrgID, agentARN),
+				AgentClassTag:   tags["specter:agent-class"],
+				OwnerTag:        tags["specter:owner"],
+				IntentStatement: intentTag,
+				IntentSource:    intentSource,
+				LastSeenAt:      now,
+			}
+
+			log.Printf("aws: bedrock agent %s — owner=%q intent_tag=%q intent_source=%q",
+				name, agent.OwnerTag, intentTag, intentSource)
 
 			// Missing owner tag → shadow / governance gap
 			if agent.OwnerTag == "" {
@@ -727,6 +738,37 @@ func (p *Plugin) scanBedrock(ctx context.Context) ([]types.CanonicalAgentRecord,
 					Plugin:        "aws",
 				})
 			}
+
+			// Always fire MISSING_INTENT_DECLARATION for Bedrock agents.
+			// A specter:intent tag (forwarded above as IntentStatement) is a hint the
+			// platform surface as a suggested intent for the operator to confirm —
+			// it is not itself a confirmed declaration. Only intentSource="specter:platform"
+			// (set when a human confirms via the Specter UI) suppresses this finding,
+			// and that suppression happens server-side in the ingest route, not here.
+			tagHint := ""
+			if agent.IntentStatement != "" {
+				tagHint = fmt.Sprintf(" (aws:tag suggestion: %q)", agent.IntentStatement)
+			}
+			evidence, _ := json.Marshal(map[string]string{
+				"agentId":     agentID,
+				"agentName":  name,
+				"intentTagValue": agent.IntentStatement,
+			})
+			findings = append(findings, types.FindingRecord{
+				RuleID:        "MISSING_INTENT_DECLARATION",
+				Severity:      "MEDIUM",
+				AgentStableID: agent.StableID,
+				AgentName:     agent.Name,
+				Title:         "No confirmed intent declaration",
+				Description: fmt.Sprintf(
+					"Bedrock agent %s has no platform-confirmed intent declaration.%s "+
+						"Open the agent in Specter and confirm its purpose to resolve this finding.",
+					name, tagHint,
+				),
+				EvidenceJSON: evidence,
+				DiscoveredAt: now,
+				Plugin:       "aws",
+			})
 
 			agents = append(agents, agent)
 		}
@@ -998,7 +1040,7 @@ func (p *Plugin) detectEphemeral(_ context.Context, events []types.NormalizedEve
 			if lifetime < 5*time.Minute {
 				parentARN := findParentFromSTSEvents(b.events, events)
 
-				agentName := "ShadowAnalytics-7f2a"
+				agentName := "ephemeral sub-agent"
 				agentStableID := stableID(p.cfg.OrgID, "ephemeral:"+principalID)
 				for i := range agents {
 					if agents[i].IAMRoleARN == parentARN || agents[i].ExternalID == parentARN {

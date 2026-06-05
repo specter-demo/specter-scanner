@@ -63,9 +63,9 @@ func Parse() *ScannerConfig {
 	flag.DurationVar(&cfg.Since, "since", 6*time.Hour, "How far back to look in audit logs")
 	flag.IntVar(&cfg.RateLimit, "rate-limit", 10, "Protocol probe requests per second per endpoint")
 	flag.StringVar(&cfg.LogLevel, "log-level", "info", "debug|info|warn|error")
-	flag.StringVar(&cfg.OrgSlug, "org-slug", "specter-demo", "Org slug for cross-org checks (standalone mode)")
+	flag.StringVar(&cfg.OrgSlug, "org-slug", "", "Org slug for cross-org A2A checks (required for cross-org edge detection)")
 	flag.StringVar(&cfg.AWSRegion, "aws-region", "us-east-1", "AWS region to scan (standalone mode)")
-	flag.StringVar(&cfg.GitHubOrg, "github-org", "specter-demo", "GitHub org to scan (standalone mode)")
+	flag.StringVar(&cfg.GitHubOrg, "github-org", "", "GitHub org to scan (required for GitHub plugin)")
 
 	flag.Parse()
 
