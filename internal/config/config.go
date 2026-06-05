@@ -28,6 +28,7 @@ type ScannerConfig struct {
 	// Mode flags
 	NoPlatform   bool
 	OutputFormat string // "json" | "html"
+	OutputFile   string // output file path (standalone mode)
 	PluginFilter string // run only this plugin
 
 	// Scan parameters
@@ -57,8 +58,9 @@ func Parse() *ScannerConfig {
 
 	flag.StringVar(&cfg.APIKey, "api-key", os.Getenv("SPECTER_API_KEY"), "Org API key")
 	flag.StringVar(&cfg.PlatformURL, "platform-url", platformURL(), "Platform API base URL")
-	flag.BoolVar(&cfg.NoPlatform, "no-platform", false, "Standalone mode: write report to stdout, no ingest")
-	flag.StringVar(&cfg.OutputFormat, "output", "html", "Output format in standalone mode: json|html")
+	flag.BoolVar(&cfg.NoPlatform, "no-platform", false, "Standalone mode: write report to file, no ingest")
+	flag.StringVar(&cfg.OutputFormat, "output", "html", "Output format in standalone mode: html|json")
+	flag.StringVar(&cfg.OutputFile, "output-file", "", "Output file path in standalone mode (default: specter-report.html or specter-report.json)")
 	flag.StringVar(&cfg.PluginFilter, "plugin", "", "Run only this plugin: aws|github|mcp|a2a")
 	flag.DurationVar(&cfg.Since, "since", 6*time.Hour, "How far back to look in audit logs")
 	flag.IntVar(&cfg.RateLimit, "rate-limit", 10, "Protocol probe requests per second per endpoint")

@@ -17,7 +17,21 @@ test:
 	go test ./... -v -timeout 60s
 
 test-demo:
-	bash scripts/run-demo-test.sh
+	@echo "Running Specter Scanner in standalone mode..."
+	AWS_PROFILE=customer-demo ./dist/specter-scanner \
+		--no-platform \
+		--output html \
+		--output-file /tmp/specter-demo-report.html \
+		--log-level info; \
+	EXIT=$$?; \
+	echo ""; \
+	test -f /tmp/specter-demo-report.html && echo "✓ HTML report generated" || (echo "✗ Report not generated" && exit 1); \
+	SIZE=$$(wc -c < /tmp/specter-demo-report.html); \
+	test $$SIZE -gt 10240 && echo "✓ Report size $$SIZE bytes (>10KB)" || echo "⚠  Report size $$SIZE bytes (unexpectedly small)"; \
+	grep -q "shadow-indexer" /tmp/specter-demo-report.html && echo "✓ shadow-indexer in report" || echo "⚠  shadow-indexer not found"; \
+	grep -q "CRITICAL" /tmp/specter-demo-report.html && echo "✓ CRITICAL findings in report" || echo "⚠  No CRITICAL findings"; \
+	grep -q "spectersystems.ai" /tmp/specter-demo-report.html && echo "✓ Footer with spectersystems.ai present" || echo "⚠  Footer not found"; \
+	test $$EXIT -eq 1 && echo "✓ Exit code 1 (CRITICAL quality gate triggered)" || echo "⚠  Expected exit 1 (CRITICAL findings), got $$EXIT"
 
 sign:
 	cosign sign-blob --output-signature dist/specter-scanner-linux-amd64.sig dist/specter-scanner-linux-amd64

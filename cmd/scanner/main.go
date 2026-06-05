@@ -17,6 +17,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -31,6 +32,7 @@ import (
 	"github.com/specter-demo/specter-scanner/internal/plugin"
 	"github.com/specter-demo/specter-scanner/internal/protocol/a2a"
 	"github.com/specter-demo/specter-scanner/internal/protocol/mcp"
+	"github.com/specter-demo/specter-scanner/internal/report"
 	"github.com/specter-demo/specter-scanner/internal/types"
 
 	// Register plugins via init()
@@ -173,8 +175,7 @@ func main() {
 	)
 
 	if cfg.NoPlatform {
-		// Write to stdout
-		if err := writeReport(cfg.OutputFormat, payload); err != nil {
+		if err := writeStandaloneReport(cfg, payload, Version); err != nil {
 			log.Fatalf("write report: %v", err)
 		}
 		return
@@ -468,60 +469,73 @@ func computeVisibility(agent *types.CanonicalAgentRecord) types.VisibilityClass 
 	return types.VisibilityClassDiscovered
 }
 
-func writeReport(format string, payload types.ScanPayload) error {
-	switch format {
-	case "json", "":
-		enc := json.NewEncoder(os.Stdout)
-		enc.SetIndent("", "  ")
-		return enc.Encode(payload)
-	case "html":
-		return writeHTMLReport(os.Stdout, payload)
-	default:
-		return fmt.Errorf("unknown output format: %q", format)
+// writeStandaloneReport generates a report file and prints a summary to stdout.
+// Exits with code 1 if CRITICAL findings are present (quality gate mode).
+func writeStandaloneReport(cfg *config.ScannerConfig, payload types.ScanPayload, version string) error {
+	format := cfg.OutputFormat
+	if format == "" {
+		format = "html"
 	}
-}
 
-func writeHTMLReport(w io.Writer, payload types.ScanPayload) error {
-	criticalCount := 0
-	highCount := 0
-	for _, f := range payload.Findings {
-		switch f.Severity {
-		case "CRITICAL":
-			criticalCount++
-		case "HIGH":
-			highCount++
+	// Determine output file path
+	outPath := cfg.OutputFile
+	if outPath == "" {
+		if format == "json" {
+			outPath = "specter-report.json"
+		} else {
+			outPath = "specter-report.html"
 		}
 	}
-
-	fmt.Fprintf(w, `<!DOCTYPE html>
-<html lang="en">
-<head><meta charset="UTF-8"><title>Specter Scanner Report — %s</title>
-<style>body{font-family:sans-serif;margin:2rem;}table{border-collapse:collapse;width:100%%;}th,td{border:1px solid #ccc;padding:0.5rem;text-align:left;}th{background:#f0f0f0;}.CRITICAL{color:#c00;font-weight:bold;}.HIGH{color:#e66;}.MEDIUM{color:#e90;}.LOW{color:#090;}</style>
-</head><body>
-<h1>Specter Scanner Report</h1>
-<p>Scan ID: <code>%s</code> | Org: <code>%s</code> | Scanned at: %s | Version: %s</p>
-<p>%d agents discovered &bull; %d findings (%d CRITICAL, %d HIGH)</p>
-<h2>Findings</h2>
-<table><tr><th>Severity</th><th>Rule</th><th>Agent</th><th>Title</th></tr>
-`, payload.OrgID, payload.ScanID, payload.OrgID, payload.ScannedAt.Format(time.RFC3339), payload.ScannerVersion,
-		len(payload.Agents), len(payload.Findings), criticalCount, highCount)
-
-	for _, f := range payload.Findings {
-		fmt.Fprintf(w, "<tr><td class=%q>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>\n",
-			f.Severity, f.Severity, f.RuleID, f.AgentName, f.Title)
+	// Normalise extension for json output
+	if format == "json" && !strings.HasSuffix(outPath, ".json") {
+		outPath = strings.TrimSuffix(outPath, ".html") + ".json"
 	}
 
-	fmt.Fprintf(w, `</table>
-<h2>Agents (%d)</h2>
-<table><tr><th>Name</th><th>Platform</th><th>Framework</th><th>Visibility</th><th>Risk</th></tr>
-`, len(payload.Agents))
+	var fileBytes []byte
+	var err error
 
-	for _, ag := range payload.Agents {
-		fmt.Fprintf(w, "<tr><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%d</td></tr>\n",
-			ag.Name, ag.Platform, ag.Framework, ag.VisibilityClass, ag.RiskScore)
+	switch format {
+	case "json":
+		fileBytes, err = json.MarshalIndent(payload, "", "  ")
+		if err != nil {
+			return fmt.Errorf("marshal json: %w", err)
+		}
+	case "html", "":
+		fileBytes, err = report.GenerateHTML(payload, version)
+		if err != nil {
+			return fmt.Errorf("generate html: %w", err)
+		}
+	default:
+		return fmt.Errorf("unknown output format %q — use html or json", format)
 	}
 
-	fmt.Fprintf(w, "</table></body></html>\n")
+	if err := os.WriteFile(outPath, fileBytes, 0o644); err != nil {
+		return fmt.Errorf("write %s: %w", outPath, err)
+	}
+
+	// Print summary to stdout
+	criticalCount := report.CountBySeverity(payload.Findings, "CRITICAL")
+	highCount     := report.CountBySeverity(payload.Findings, "HIGH")
+	mediumCount   := report.CountBySeverity(payload.Findings, "MEDIUM")
+	lowCount      := report.CountBySeverity(payload.Findings, "LOW")
+
+	fmt.Printf("\nSpecter Scanner — Scan Complete\n")
+	fmt.Printf("════════════════════════════════\n")
+	fmt.Printf("Agents discovered:  %d\n", len(payload.Agents))
+	fmt.Printf("Total findings:     %d\n", len(payload.Findings))
+	fmt.Printf("  CRITICAL:         %d\n", criticalCount)
+	fmt.Printf("  HIGH:             %d\n", highCount)
+	fmt.Printf("  MEDIUM:           %d\n", mediumCount)
+	fmt.Printf("  LOW:              %d\n", lowCount)
+	fmt.Printf("\nReport written to:  %s\n", outPath)
+
+	// Quality gate: exit 1 if CRITICAL findings detected
+	if criticalCount > 0 {
+		fmt.Printf("\n⚠  CRITICAL findings detected — quality gate FAILED\n")
+		fmt.Printf("   Resolve all CRITICAL findings before deploying.\n")
+		os.Exit(1)
+	}
+
 	return nil
 }
 
