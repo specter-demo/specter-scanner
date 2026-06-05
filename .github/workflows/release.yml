@@ -5,48 +5,78 @@ on:
     tags:
       - 'v*'
 
-permissions:
-  contents: write
-  id-token: write
-
 jobs:
-  release:
+  build:
+    name: Build and release
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
           go-version: '1.22'
-          cache: true
 
       - name: Run tests
-        run: go test ./... -v -timeout 60s
+        run: make test
 
-      - name: Build all targets
+      - name: Build binaries
         run: |
           mkdir -p dist
-          VERSION="${GITHUB_REF_NAME}" make build-all
 
-      - name: Install cosign
-        uses: sigstore/cosign-installer@v3
+          GOOS=linux   GOARCH=amd64  go build -ldflags="-s -w -X main.Version=${{ github.ref_name }}" -o dist/specter-scanner-linux-amd64   ./cmd/scanner
+          GOOS=linux   GOARCH=arm64  go build -ldflags="-s -w -X main.Version=${{ github.ref_name }}" -o dist/specter-scanner-linux-arm64   ./cmd/scanner
+          GOOS=darwin  GOARCH=amd64  go build -ldflags="-s -w -X main.Version=${{ github.ref_name }}" -o dist/specter-scanner-darwin-amd64  ./cmd/scanner
+          GOOS=darwin  GOARCH=arm64  go build -ldflags="-s -w -X main.Version=${{ github.ref_name }}" -o dist/specter-scanner-darwin-arm64  ./cmd/scanner
+          GOOS=windows GOARCH=amd64  go build -ldflags="-s -w -X main.Version=${{ github.ref_name }}" -o dist/specter-scanner-windows-amd64.exe ./cmd/scanner
 
-      - name: Sign linux-amd64 binary
+      - name: Create checksums
         run: |
-          cosign sign-blob \
-            --yes \
-            --output-signature dist/specter-scanner-linux-amd64.sig \
-            dist/specter-scanner-linux-amd64
+          cd dist
+          sha256sum specter-scanner-* > checksums.txt
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
+          name: "Specter Scanner ${{ github.ref_name }}"
+          body: |
+            ## Specter Scanner ${{ github.ref_name }}
+
+            Open-source AI agent security scanner. Discovers, classifies, and audits AI agents running in your AWS infrastructure and GitHub repositories.
+
+            ### Installation
+
+            Download the binary for your platform, make it executable, and move it to your PATH:
+
+            ```bash
+            # macOS (Apple Silicon)
+            curl -Lo specter-scanner https://github.com/spectersystems/specter-scanner/releases/download/${{ github.ref_name }}/specter-scanner-darwin-arm64
+            chmod +x specter-scanner && sudo mv specter-scanner /usr/local/bin/
+
+            # macOS (Intel)
+            curl -Lo specter-scanner https://github.com/spectersystems/specter-scanner/releases/download/${{ github.ref_name }}/specter-scanner-darwin-amd64
+            chmod +x specter-scanner && sudo mv specter-scanner /usr/local/bin/
+
+            # Linux (amd64)
+            curl -Lo specter-scanner https://github.com/spectersystems/specter-scanner/releases/download/${{ github.ref_name }}/specter-scanner-linux-amd64
+            chmod +x specter-scanner && sudo mv specter-scanner /usr/local/bin/
+            ```
+
+            See the [README](https://github.com/spectersystems/specter-scanner#readme) for full configuration options.
+
+            ### Checksums
+
+            Verify your download with the included checksums.txt file.
           files: |
             dist/specter-scanner-linux-amd64
-            dist/specter-scanner-linux-amd64.sig
             dist/specter-scanner-linux-arm64
             dist/specter-scanner-darwin-amd64
             dist/specter-scanner-darwin-arm64
             dist/specter-scanner-windows-amd64.exe
-          generate_release_notes: true
+            dist/checksums.txt
+          draft: false
+          prerelease: false
