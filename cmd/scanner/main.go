@@ -101,7 +101,7 @@ func main() {
 	// ── Phase: AWS_DISCOVERY ─────────────────────────────────────────────────
 	postPhaseUpdate(cfg, scanID, "AWS_DISCOVERY", "RUNNING", "Discovering agents in AWS", 0, 0, 0)
 	phaseStart := time.Now()
-	result, err := runScan(ctx, cfg, scanID)
+	result, err := runScan(ctx, cfg, scanID, platformCfg)
 	if err != nil {
 		postPhaseUpdate(cfg, scanID, "AWS_DISCOVERY", "FAILED", err.Error(), 0, 0, int(time.Since(phaseStart).Milliseconds()))
 		log.Fatalf("scan failed: %v", err)
@@ -369,7 +369,7 @@ func configurePlugins(cfg *config.ScannerConfig, platformCfg *config.PlatformCon
 // Phase 2: the GitHub plugin is reconfigured with Phase 1 agents as SeedAgents,
 // then run. Its returned agents are merged back into the Phase 1 set (in-place
 // update by stableId) rather than appended, preventing duplicates.
-func runScan(ctx context.Context, cfg *config.ScannerConfig, scanID string) (*combinedScanResult, error) {
+func runScan(ctx context.Context, cfg *config.ScannerConfig, scanID string, platformCfg *config.PlatformConfig) (*combinedScanResult, error) {
 	var allPlugins []plugin.ScanPlugin
 	if cfg.PluginFilter != "" {
 		p, err := plugin.Get(cfg.PluginFilter)
@@ -438,19 +438,34 @@ func runScan(ctx context.Context, cfg *config.ScannerConfig, scanID string) (*co
 		postPhaseUpdate(cfg, scanID, "GITHUB_ENRICHMENT", "RUNNING", "Enriching agents with GitHub data", 0, 0, 0)
 		ghPhaseStart := time.Now()
 
-		ghRawCfg, err := json.Marshal(map[string]interface{}{
-			"token":          cfg.GitHubToken,
-			"org":            cfg.GitHubOrg,
-			"tier2Discovery": true,
-			"excludeRepos": []string{
-				"specter-scanner",
-				"specter-platform",
-				"*-archived",
-				"*-template",
-			},
-		})
-		if err != nil {
-			return nil, fmt.Errorf("marshal github config for phase 2: %w", err)
+		// Phase 2 GitHub config: platform config takes precedence (same as Phase 1).
+		var ghRawCfg []byte
+		if platformCfg != nil {
+			if ghPlugin := platformCfg.FindPlugin("GITHUB"); ghPlugin != nil {
+				var err error
+				ghRawCfg, err = ghPlugin.RawConfig()
+				if err != nil {
+					return nil, fmt.Errorf("marshal github platform config for phase 2: %w", err)
+				}
+			}
+		}
+		if ghRawCfg == nil {
+			// Fallback to CLI flags for standalone mode
+			var err error
+			ghRawCfg, err = json.Marshal(map[string]interface{}{
+				"token":          cfg.GitHubToken,
+				"org":            cfg.GitHubOrg,
+				"tier2Discovery": true,
+				"excludeRepos": []string{
+					"specter-scanner",
+					"specter-platform",
+					"*-archived",
+					"*-template",
+				},
+			})
+			if err != nil {
+				return nil, fmt.Errorf("marshal github config for phase 2: %w", err)
+			}
 		}
 		if err := githubPlugin.Configure(plugin.PluginConfig{
 			OrgID:      cfg.OrgID,
