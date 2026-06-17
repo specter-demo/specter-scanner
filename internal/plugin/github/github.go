@@ -41,6 +41,13 @@ type GitHubPluginConfig struct {
 	Org        string `json:"org"`
 	AppID      int64  `json:"appId"`
 	PrivateKey string `json:"privateKey"`
+
+	// Tier 2 GitHub-native discovery configuration.
+	IncludeRepos   []string `json:"includeRepos,omitempty"`  // glob patterns; if set, only matching repos are eligible
+	ExcludeRepos   []string `json:"excludeRepos,omitempty"`  // glob patterns; matching repos are always skipped
+	RequireTopics  []string `json:"requireTopics,omitempty"` // if set, repo must have at least one of these topics
+	ScanPaths      []string `json:"scanPaths,omitempty"`     // additional subdirectories to check for entrypoint files
+	Tier2Discovery bool     `json:"tier2Discovery"`          // enable standalone GITHUB-platform agent records for unmatched repos
 }
 
 // Plugin is the GitHub scanner plugin.
@@ -197,6 +204,8 @@ func (p *Plugin) Scan(ctx context.Context) (*plugin.ScanResult, error) {
 		ListOptions: gogithub.ListOptions{PerPage: 100},
 	}
 
+	var allRepos []*gogithub.Repository
+
 	for {
 		repos, resp, err := client.Repositories.ListByOrg(ctx, p.ghCfg.Org, opts)
 		if err != nil {
@@ -204,6 +213,8 @@ func (p *Plugin) Scan(ctx context.Context) (*plugin.ScanResult, error) {
 		}
 
 		for _, repo := range repos {
+			allRepos = append(allRepos, repo)
+
 			agent, findings, repoRefs := p.scanRepo(ctx, client, repo, p.cfg.SeedAgents)
 			if agent != nil {
 				result.Agents = append(result.Agents, *agent)
@@ -216,6 +227,29 @@ func (p *Plugin) Scan(ctx context.Context) (*plugin.ScanResult, error) {
 			break
 		}
 		opts.Page = resp.NextPage
+	}
+
+	// ── Tier 2: GitHub-native agent discovery ────────────────────────────────
+	// Find AI agents that exist only in GitHub repos with no AWS footprint.
+	// Skip repos that already matched a seed agent from Phase 1 (AWS), since
+	// those are enriched in-place above and must not produce duplicate records.
+	if p.ghCfg.Tier2Discovery {
+		ignore := p.loadSpecterIgnore(ctx, client)
+
+		for _, repo := range allRepos {
+			if matchSeedAgent(repo.GetName(), p.cfg.SeedAgents) != nil {
+				continue // already covered by Mode 1 enrichment
+			}
+			if !p.shouldScanRepo(repo, ignore) {
+				continue
+			}
+
+			agent, findings := p.scanRepoTier2(ctx, client, repo)
+			if agent != nil {
+				result.Agents = append(result.Agents, *agent)
+				result.Findings = append(result.Findings, findings...)
+			}
+		}
 	}
 
 	return result, nil
@@ -237,6 +271,12 @@ type GitHubRepoContent struct {
 	IntentText   string // raw text of the intent file
 	IntentSource string // file name that was found
 	IntentOwner  string // owner declared in intent file
+
+	// Manifest deployment declaration (populated when .specter/manifest.yaml
+	// contains a deployment.target field — a formal infrastructure declaration
+	// that takes precedence over CI/Dockerfile detection).
+	ManifestDeploymentTarget string // e.g. "aws_lambda", "aws_ecs", "kubernetes"
+	ManifestDeploymentStatus string // e.g. "pending", "active", "deprecated"
 
 	// Phase 11.5: source code references
 	SourceRefs []types.StaticRef
@@ -553,9 +593,18 @@ const (
 type specterManifest struct {
 	Specter struct {
 		Agent struct {
-			Intent               string   `yaml:"intent"`
-			Owner                string   `yaml:"owner"`
-			RiskAcknowledgements []string `yaml:"risk_acknowledgements"`
+			Intent       string                 `yaml:"intent"`
+			Owner        string                 `yaml:"owner"`
+			Capabilities []string               `yaml:"capabilities"`
+			// RiskAcknowledgements is a free-form map (handles_pii: true, etc.);
+			// declared as map[string]interface{} to tolerate any value type.
+			RiskAcknowledgements map[string]interface{} `yaml:"risk_acknowledgements"`
+			Deployment struct {
+				Target      string `yaml:"target"`
+				Status      string `yaml:"status"`
+				Region      string `yaml:"region"`
+				Environment string `yaml:"environment"`
+			} `yaml:"deployment"`
 		} `yaml:"agent"`
 	} `yaml:"specter"`
 	// Legacy flat fields for backward compatibility
@@ -586,6 +635,15 @@ func (p *Plugin) extractIntentDeclaration(ctx context.Context, client *gogithub.
 				content.IntentText = truncate(intent, 500)
 				content.IntentSource = IntentSourceManifest
 				content.IntentOwner = owner
+			}
+			// Capture deployment declaration regardless of whether intent was found.
+			// A deployment.target is a formal governance statement even when
+			// status is "pending" and even when the manifest has no intent field.
+			if m.Specter.Agent.Deployment.Target != "" {
+				content.ManifestDeploymentTarget = m.Specter.Agent.Deployment.Target
+				content.ManifestDeploymentStatus = m.Specter.Agent.Deployment.Status
+			}
+			if intent != "" {
 				return
 			}
 		}

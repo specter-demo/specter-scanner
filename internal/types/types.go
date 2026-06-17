@@ -202,6 +202,12 @@ type CanonicalAgentRecord struct {
 	AlignmentTier    string   `json:"alignmentTier,omitempty"`    // "ALIGNED" | "PARTIAL" | "MISMATCHED" | "UNKNOWN"
 	AlignmentMismatch []string `json:"alignmentMismatch,omitempty"` // specific mismatches found
 	IntentOwner      string   `json:"intentOwner,omitempty"`      // owner declared in intent file
+
+	// Tier 2 GitHub-native discovery (agents found only via repo scanning, no AWS footprint)
+	RepoName            string  `json:"repoName,omitempty"`
+	RepoURL             string  `json:"repoUrl,omitempty"`
+	DeploymentPlatform  string  `json:"deploymentPlatform,omitempty"` // "AWS_ECS" | "AWS_LAMBDA" | "CONTAINER" | "UNDETECTED"
+	DiscoveryConfidence float64 `json:"confidence,omitempty"`         // 0.0-1.0 confidence this repo hosts an AI agent
 }
 
 // AgentEdgeRecord represents a relationship between two agents.

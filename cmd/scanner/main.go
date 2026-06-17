@@ -163,6 +163,11 @@ func main() {
 
 	postPhaseUpdate(cfg, scanID, "CLASSIFICATION", "COMPLETE", "", len(result.Agents), len(result.Findings), int(time.Since(phaseStart).Milliseconds()))
 
+	// Safety net: drop any finding that references an unknown agent stableId.
+	// This catches pipeline bugs loudly rather than letting orphan findings
+	// reach the platform or confuse the report.
+	result.Findings = validateFindings(result.Agents, result.Findings)
+
 	// Assemble payload
 	payload := ingest.Assemble(
 		scanID,
@@ -294,8 +299,18 @@ func configurePlugins(cfg *config.ScannerConfig) error {
 			}
 		case "github":
 			ghCfg := map[string]interface{}{
-				"token": cfg.GitHubToken,
-				"org":   cfg.GitHubOrg,
+				"token":          cfg.GitHubToken,
+				"org":            cfg.GitHubOrg,
+				"tier2Discovery": true,
+				// Exclude known infrastructure repos that are not AI agents.
+				// Platform and scanner repos live alongside agent repos in the
+				// same org and would otherwise produce false-positive records.
+				"excludeRepos": []string{
+					"specter-scanner",
+					"specter-platform",
+					"*-archived",
+					"*-template",
+				},
 			}
 			var err error
 			rawConfig, err = json.Marshal(ghCfg)
@@ -394,8 +409,15 @@ func runScan(ctx context.Context, cfg *config.ScannerConfig, scanID string) (*co
 		ghPhaseStart := time.Now()
 
 		ghRawCfg, err := json.Marshal(map[string]interface{}{
-			"token": cfg.GitHubToken,
-			"org":   cfg.GitHubOrg,
+			"token":          cfg.GitHubToken,
+			"org":            cfg.GitHubOrg,
+			"tier2Discovery": true,
+			"excludeRepos": []string{
+				"specter-scanner",
+				"specter-platform",
+				"*-archived",
+				"*-template",
+			},
 		})
 		if err != nil {
 			return nil, fmt.Errorf("marshal github config for phase 2: %w", err)
@@ -422,8 +444,17 @@ func runScan(ctx context.Context, cfg *config.ScannerConfig, scanID string) (*co
 				// Enrich Phase 1 agents in-place with GitHub data (intent, alignment,
 				// framework). The GitHub plugin returns copies of matched seed agents
 				// with enriched fields; we replace the Phase 1 record by stableId.
-				// We do NOT append them as new agents to avoid duplicate records.
+				// We do NOT duplicate these as new agents.
+				//
+				// Tier 2 discovery additionally returns standalone agent records for
+				// repos with no AWS footprint (VisibilitySource == "TIER_2", new
+				// stableIds not present in combined.Agents) — these are appended.
 				if len(r.Agents) > 0 {
+					existingStableIDs := make(map[string]bool, len(combined.Agents))
+					for _, a := range combined.Agents {
+						existingStableIDs[a.StableID] = true
+					}
+
 					ghByStableID := make(map[string]types.CanonicalAgentRecord, len(r.Agents))
 					for _, a := range r.Agents {
 						ghByStableID[a.StableID] = a
@@ -431,6 +462,12 @@ func runScan(ctx context.Context, cfg *config.ScannerConfig, scanID string) (*co
 					for i := range combined.Agents {
 						if enriched, ok := ghByStableID[combined.Agents[i].StableID]; ok {
 							combined.Agents[i] = enriched
+						}
+					}
+
+					for _, a := range r.Agents {
+						if !existingStableIDs[a.StableID] {
+							combined.Agents = append(combined.Agents, a)
 						}
 					}
 				}
@@ -457,16 +494,51 @@ type combinedScanResult struct {
 	StaticRefs []types.StaticRef
 }
 
-func computeVisibility(agent *types.CanonicalAgentRecord) types.VisibilityClass {
-	// Shadow: no owner tag and no governance metadata
-	if agent.OwnerTag == "" && agent.AgentClassTag == "" {
-		return types.VisibilityClassShadow
+// validateFindings removes findings with empty or dangling AgentStableID values.
+// Any finding that survives this check is guaranteed to have a corresponding
+// agent record in the payload; the platform rejects dangling references.
+func validateFindings(agents []types.CanonicalAgentRecord, findings []types.FindingRecord) []types.FindingRecord {
+	validStableIDs := make(map[string]string, len(agents))
+	for _, a := range agents {
+		validStableIDs[a.StableID] = a.Name
 	}
-	// Governed: has owner tag
+	out := findings[:0]
+	for _, f := range findings {
+		if f.AgentStableID == "" {
+			log.Printf("PIPELINE ERROR: finding %s has empty AgentStableID — dropping", f.RuleID)
+			continue
+		}
+		if _, ok := validStableIDs[f.AgentStableID]; !ok {
+			log.Printf("PIPELINE ERROR: finding %s references unknown AgentStableID %s — dropping", f.RuleID, f.AgentStableID)
+			continue
+		}
+		out = append(out, f)
+	}
+	return out
+}
+
+func computeVisibility(agent *types.CanonicalAgentRecord) types.VisibilityClass {
+	// GOVERNED: AWS resource tag explicitly names an owner team.
 	if agent.OwnerTag != "" {
 		return types.VisibilityClassGoverned
 	}
-	return types.VisibilityClassDiscovered
+
+	// DISCOVERED: agent is confirmed and has some governance signal — either
+	// a formal intent declaration (.specter/manifest.yaml, AGENT.md, CLAUDE.md)
+	// or detected/declared deployment infrastructure. README-only intent is
+	// informal and does not satisfy this threshold.
+	hasFormalIntent := agent.IntentSource == "MANIFEST" ||
+		agent.IntentSource == "AGENT_MD" ||
+		agent.IntentSource == "CLAUDE_MD"
+	hasDeployInfra := agent.DeploymentPlatform != "" &&
+		agent.DeploymentPlatform != "UNDETECTED"
+	if agent.AgentClassTag != "" || hasFormalIntent || hasDeployInfra {
+		return types.VisibilityClassDiscovered
+	}
+
+	// SHADOW: high-confidence agent signal (framework/dependency) but no formal
+	// intent file and no detectable/declared deployment infrastructure.
+	return types.VisibilityClassShadow
 }
 
 // writeStandaloneReport generates a report file and prints a summary to stdout.

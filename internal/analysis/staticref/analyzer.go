@@ -176,11 +176,24 @@ func intentFindings(ag *types.CanonicalAgentRecord, now time.Time) []types.Findi
 		return nil
 	}
 
-	// MISSING_INTENT_DECLARATION: no intent file, or README with fewer than 50 words
-	if ag.IntentStatement == "" {
+	// MISSING_INTENT_DECLARATION fires in two distinct cases:
+	//   (a) No intent found from any source — early return because subsequent
+	//       intent-quality checks (owner, alignment) are vacuously irrelevant.
+	//   (b) Intent found only from README — informative but not a formal
+	//       governance declaration; do NOT early-return so INTENT_OWNER_ABSENT
+	//       can also fire if no owner is present in the README text.
+	//
+	// Formal sources: MANIFEST, AGENT_MD, CLAUDE_MD.
+	// Informal source: README — does not constitute a policy-grade declaration.
+	isFormalIntent := ag.IntentStatement != "" &&
+		ag.IntentSource != "" &&
+		ag.IntentSource != "README"
+
+	if !isFormalIntent {
 		evidence, _ := json.Marshal(map[string]string{
 			"agentName":     ag.Name,
 			"platform":      ag.Platform,
+			"intentSource":  ag.IntentSource,
 			"visibilityClass": string(ag.VisibilityClass),
 		})
 		findings = append(findings, types.FindingRecord{
@@ -188,17 +201,21 @@ func intentFindings(ag *types.CanonicalAgentRecord, now time.Time) []types.Findi
 			Severity:      "MEDIUM",
 			AgentStableID: ag.StableID,
 			AgentName:     ag.Name,
-			Title:         "No intent declaration found for agent",
+			Title:         "No formal intent declaration found for agent",
 			Description: fmt.Sprintf(
-				"Agent %s has no readable intent file (.specter/manifest.yaml, AGENT.md, CLAUDE.md) "+
-					"and no README with sufficient description (≥50 words).",
+				"Agent %s has no formal intent file (.specter/manifest.yaml, AGENT.md, CLAUDE.md). "+
+					"A README description is not a sufficient governance declaration.",
 				ag.Name,
 			),
 			EvidenceJSON: evidence,
 			DiscoveredAt: now,
 			Plugin:       "staticref",
 		})
-		return findings
+		if ag.IntentStatement == "" {
+			// No intent at all — remaining checks are meaningless.
+			return findings
+		}
+		// README-only intent: fall through so INTENT_OWNER_ABSENT can also fire.
 	}
 
 	// INTENT_MISMATCH: alignment score below threshold
