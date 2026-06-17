@@ -81,8 +81,20 @@ func main() {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
 
+	// Fetch platform config (in platform mode) to get plugin settings including GitHub org.
+	var platformCfg *config.PlatformConfig
+	if !cfg.NoPlatform && cfg.PlatformURL != "" && cfg.APIKey != "" {
+		var err error
+		platformCfg, err = config.FetchPlatformConfig(cfg.PlatformURL, cfg.APIKey)
+		if err != nil {
+			log.Printf("WARNING: could not fetch platform config: %v — falling back to CLI flags", err)
+		} else {
+			log.Printf("Platform config fetched: %d plugin(s)", len(platformCfg.Plugins))
+		}
+	}
+
 	// Configure plugins
-	if err := configurePlugins(cfg); err != nil {
+	if err := configurePlugins(cfg, platformCfg); err != nil {
 		log.Fatalf("configure plugins: %v", err)
 	}
 
@@ -275,7 +287,7 @@ func checkCancelled(cfg *config.ScannerConfig, scanID string) bool {
 	return result.Status == "CANCELLED"
 }
 
-func configurePlugins(cfg *config.ScannerConfig) error {
+func configurePlugins(cfg *config.ScannerConfig, platformCfg *config.PlatformConfig) error {
 	plugins := plugin.All()
 
 	for _, p := range plugins {
@@ -289,7 +301,7 @@ func configurePlugins(cfg *config.ScannerConfig) error {
 				"region":         cfg.AWSRegion,
 				// Cross-account role for cloud-hosted scanning.
 				// Empty in standalone mode; set via SPECTER_READONLY_ROLE_ARN in ECS.
-				"roleArn":   config.ReadonlyRoleARN(),
+				"roleArn":    config.ReadonlyRoleARN(),
 				"externalId": config.ReadonlyExternalID(),
 			}
 			var err error
@@ -297,14 +309,32 @@ func configurePlugins(cfg *config.ScannerConfig) error {
 			if err != nil {
 				return fmt.Errorf("marshal aws config: %w", err)
 			}
+
 		case "github":
+			// Platform config takes precedence — org and discovery settings
+			// come from the Plugin record stored in the platform DB.
+			// Authentication (token) comes from env vars via getGitHubToken().
+			if platformCfg != nil {
+				if ghPlugin := platformCfg.FindPlugin("GITHUB"); ghPlugin != nil {
+					var err error
+					rawConfig, err = ghPlugin.RawConfig()
+					if err != nil {
+						return fmt.Errorf("marshal github platform config: %w", err)
+					}
+					org, _ := ghPlugin.Config["org"].(string)
+					log.Printf("[config] GitHub plugin configured from platform: org=%s", org)
+					break
+				}
+			}
+			// Fallback: CLI flags for standalone mode
+			if cfg.GitHubOrg == "" {
+				log.Printf("[config] GitHub plugin: no platform config and no --github-org flag — skipping")
+				continue
+			}
 			ghCfg := map[string]interface{}{
 				"token":          cfg.GitHubToken,
 				"org":            cfg.GitHubOrg,
 				"tier2Discovery": true,
-				// Exclude known infrastructure repos that are not AI agents.
-				// Platform and scanner repos live alongside agent repos in the
-				// same org and would otherwise produce false-positive records.
 				"excludeRepos": []string{
 					"specter-scanner",
 					"specter-platform",
@@ -320,10 +350,10 @@ func configurePlugins(cfg *config.ScannerConfig) error {
 		}
 
 		if err := p.Configure(plugin.PluginConfig{
-			OrgID:     cfg.OrgID,
-			OrgSlug:   cfg.OrgSlug,
+			OrgID:      cfg.OrgID,
+			OrgSlug:    cfg.OrgSlug,
 			PluginType: p.Name(),
-			RawConfig: rawConfig,
+			RawConfig:  rawConfig,
 		}); err != nil {
 			return fmt.Errorf("configure plugin %s: %w", p.Name(), err)
 		}

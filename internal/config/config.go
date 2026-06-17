@@ -6,10 +6,76 @@
 package config
 
 import (
+	"encoding/json"
 	"flag"
+	"fmt"
+	"io"
+	"net/http"
 	"os"
+	"strings"
 	"time"
 )
+
+// PlatformConfig is the response from GET /api/v1/scanner/config.
+type PlatformConfig struct {
+	OrgID               string         `json:"orgId"`
+	SigningKey           string         `json:"signingKey"`
+	ScanIntervalMinutes int            `json:"scanIntervalMinutes"`
+	Plugins             []PluginConfig `json:"plugins"`
+}
+
+// PluginConfig represents one plugin entry in the platform config response.
+type PluginConfig struct {
+	PluginType string                 `json:"pluginType"`
+	Status     string                 `json:"status"`
+	Config     map[string]interface{} `json:"config"`
+}
+
+// RawConfig marshals the plugin's Config map to JSON bytes for passing to plugin.Configure.
+func (p PluginConfig) RawConfig() ([]byte, error) {
+	return json.Marshal(p.Config)
+}
+
+// FindPlugin returns the first CONNECTED plugin matching pluginType, or nil.
+func (pc *PlatformConfig) FindPlugin(pluginType string) *PluginConfig {
+	for i := range pc.Plugins {
+		if strings.EqualFold(pc.Plugins[i].PluginType, pluginType) &&
+			pc.Plugins[i].Status == "CONNECTED" {
+			return &pc.Plugins[i]
+		}
+	}
+	return nil
+}
+
+// FetchPlatformConfig fetches the scanner config from the platform API.
+func FetchPlatformConfig(platformURL, apiKey string) (*PlatformConfig, error) {
+	if platformURL == "" || apiKey == "" {
+		return nil, fmt.Errorf("platform URL and API key required")
+	}
+	req, err := http.NewRequest(http.MethodGet, platformURL+"/api/v1/scanner/config", nil)
+	if err != nil {
+		return nil, fmt.Errorf("build request: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+apiKey)
+
+	client := &http.Client{Timeout: 15 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("fetch platform config: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return nil, fmt.Errorf("platform config returned %d: %s", resp.StatusCode, string(body))
+	}
+
+	var cfg PlatformConfig
+	if err := json.NewDecoder(resp.Body).Decode(&cfg); err != nil {
+		return nil, fmt.Errorf("decode platform config: %w", err)
+	}
+	return &cfg, nil
+}
 
 // ReadonlyRoleARN returns the cross-account SpecterReadOnly role ARN from the
 // environment. Set via SPECTER_READONLY_ROLE_ARN in cloud-hosted ECS mode.
