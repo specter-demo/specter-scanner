@@ -151,13 +151,25 @@ func main() {
 	postPhaseUpdate(cfg, scanID, "CLASSIFICATION", "RUNNING", "Classifying agents and computing risk", 0, 0, 0)
 	phaseStart = time.Now()
 
-	// Static reference analysis
+	// Partition agents by governance scope using plugin-set VisibilityClass values.
+	// External agents (UNREGISTERED) are outside Specter's governance scope —
+	// they appear in the inventory but receive no governance findings.
+	// Protocol analyzers (A2A, MCP) already ran on all agents above.
+	preClassGoverned, _ := partitionByGovernanceScope(result.Agents)
+	log.Printf("[scope] %d governed agents, %d external agents (pre-classification)",
+		len(preClassGoverned), len(result.Agents)-len(preClassGoverned))
+
+	// Static reference analysis — governed agents only.
+	// staticref generates intent and governance findings; external agents are
+	// outside the governance scope and must not receive these.
 	staticAnalyzer := staticref.New(cfg.OrgID)
-	staticEdges, staticFindings := staticAnalyzer.Analyze(ctx, result.Agents, result.StaticRefs, result.Edges)
+	staticEdges, staticFindings := staticAnalyzer.Analyze(ctx, preClassGoverned, result.StaticRefs, result.Edges)
 	result.Edges = append(result.Edges, staticEdges...)
 	result.Findings = append(result.Findings, staticFindings...)
 
-	// Classification pass
+	// Classification pass — all agents.
+	// computeVisibility preserves UNREGISTERED so external agents are not
+	// reclassified as SHADOW/GOVERNED/DISCOVERED by this pass.
 	for i := range result.Agents {
 		agent := &result.Agents[i]
 		*agent = classify.DetectFramework(*agent, nil)
@@ -167,11 +179,17 @@ func main() {
 		agent.RiskScore = classify.ComputeRiskScore(agent, result.Edges)
 	}
 
-	// Blast radius computation
-	result.Agents = blast.Compute(result.Agents, result.Edges)
+	// Re-partition using post-classification values — blast radius and chain
+	// reconstruction operate on governed agents only, and need the updated
+	// RiskScore / FunctionalClass from the classification pass above.
+	governedAgents, externalAgents := partitionByGovernanceScope(result.Agents)
 
-	// Delegation chain reconstruction
-	chains := chain.Reconstruct(result.Agents, result.Edges, result.Events)
+	// Blast radius — governed agents only.
+	result.Agents = blast.Compute(governedAgents, result.Edges)
+	result.Agents = append(result.Agents, externalAgents...)
+
+	// Delegation chain reconstruction — governed agents only.
+	chains := chain.Reconstruct(governedAgents, result.Edges, result.Events)
 
 	postPhaseUpdate(cfg, scanID, "CLASSIFICATION", "COMPLETE", "", len(result.Agents), len(result.Findings), int(time.Since(phaseStart).Milliseconds()))
 
@@ -542,6 +560,18 @@ type combinedScanResult struct {
 // validateFindings removes findings with empty or dangling AgentStableID values.
 // Any finding that survives this check is guaranteed to have a corresponding
 // agent record in the payload; the platform rejects dangling references.
+// governanceFindingTypes is the set of finding types that express governance posture.
+// These must never target UNREGISTERED (external) agents — they are outside
+// Specter's governance scope. The scope partition in the CLASSIFICATION phase is
+// the primary mechanism; Gate 3 here is defense-in-depth.
+var governanceFindingTypes = map[string]bool{
+	"MISSING_INTENT_DECLARATION":        true,
+	"MISSING_INTENT_DECLARATION_BEDROCK": true,
+	"INTENT_OWNER_ABSENT":               true,
+	"INTENT_MISMATCH":                   true,
+	"NHI_ORPHANED_CREATOR":              true,
+}
+
 func validateFindings(
 	agents []types.CanonicalAgentRecord,
 	findings []types.FindingRecord,
@@ -549,22 +579,36 @@ func validateFindings(
 ) []types.FindingRecord {
 	validStableIDs := make(map[string]bool, len(agents))
 	stableToExternal := make(map[string]string, len(agents))
+	stableToClass := make(map[string]types.VisibilityClass, len(agents))
 	for _, a := range agents {
 		validStableIDs[a.StableID] = true
 		stableToExternal[a.StableID] = a.ExternalID
+		stableToClass[a.StableID] = a.VisibilityClass
 	}
 	var out []types.FindingRecord
 	for _, f := range findings {
+		// Gate 1: AgentStableID must be set
 		if f.AgentStableID == "" {
 			log.Printf("PIPELINE WARNING: finding %s (agent=%s) has empty AgentStableID — dropping",
 				f.RuleID, f.AgentName)
 			continue
 		}
+		// Gate 2: Agent must exist in this scan
 		if !validStableIDs[f.AgentStableID] {
 			log.Printf("PIPELINE WARNING: finding %s references unknown AgentStableID %s — dropping",
 				f.RuleID, f.AgentStableID)
 			continue
 		}
+		// Gate 3: Governance findings must not target UNREGISTERED agents.
+		// Primary protection: the scope partition passes only governed agents
+		// to staticref. This gate catches any future analyzer that bypasses it.
+		if stableToClass[f.AgentStableID] == types.VisibilityClassUnregistered &&
+			governanceFindingTypes[f.RuleID] {
+			log.Printf("PIPELINE ERROR: governance finding %s generated for UNREGISTERED agent %s — dropping (analyzer scope bug)",
+				f.RuleID, f.AgentName)
+			continue
+		}
+		// Gate 4: Platform suppression
 		if platformCfg != nil {
 			externalID := stableToExternal[f.AgentStableID]
 			if platformCfg.IsSuppressed(externalID, f.RuleID) {
@@ -577,7 +621,36 @@ func validateFindings(
 	return out
 }
 
+// partitionByGovernanceScope splits agents into two sets:
+//   - governed: agents within Specter's governance scope
+//     (GOVERNED, DISCOVERED, SHADOW) — receive full governance analysis:
+//     intent findings, blast radius, chain reconstruction.
+//   - external: agents outside Specter's governance scope
+//     (UNREGISTERED — cross-org dependencies detected by protocol probes)
+//     These appear in the inventory but receive NO governance findings.
+//     Protocol findings (A2A, MCP) are valid for all agents regardless of scope.
+func partitionByGovernanceScope(agents []types.CanonicalAgentRecord) (
+	governed []types.CanonicalAgentRecord,
+	external []types.CanonicalAgentRecord,
+) {
+	for _, a := range agents {
+		if a.VisibilityClass == types.VisibilityClassUnregistered {
+			external = append(external, a)
+		} else {
+			governed = append(governed, a)
+		}
+	}
+	return governed, external
+}
+
 func computeVisibility(agent *types.CanonicalAgentRecord) types.VisibilityClass {
+	// UNREGISTERED: external dependency outside governance scope — set by the plugin
+	// that discovered it (e.g. cross-org A2A dependency). Preserve unconditionally;
+	// UNREGISTERED is a scope classification, not a governance signal.
+	if agent.VisibilityClass == types.VisibilityClassUnregistered {
+		return types.VisibilityClassUnregistered
+	}
+
 	// GOVERNED: AWS resource tag explicitly names an owner team.
 	if agent.OwnerTag != "" {
 		return types.VisibilityClassGoverned

@@ -118,13 +118,11 @@ func (a *Analyzer) Analyze(
 		}
 	}
 
-	// Intent-based findings: MISSING_INTENT_DECLARATION, INTENT_MISMATCH, INTENT_OWNER_ABSENT
-	// UNREGISTERED agents are external dependencies outside governance scope — skip.
+	// Intent-based findings: MISSING_INTENT_DECLARATION, INTENT_MISMATCH, INTENT_OWNER_ABSENT.
+	// The caller (pipeline) is responsible for passing only governed agents to this analyzer.
+	// No UNREGISTERED skip needed here — scope enforcement is at the pipeline level.
 	for i := range agents {
 		ag := &agents[i]
-		if ag.VisibilityClass == types.VisibilityClassUnregistered {
-			continue
-		}
 		intentFindings := intentFindings(ag, now)
 		findings = append(findings, intentFindings...)
 	}
