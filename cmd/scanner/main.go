@@ -151,6 +151,19 @@ func main() {
 	postPhaseUpdate(cfg, scanID, "CLASSIFICATION", "RUNNING", "Classifying agents and computing risk", 0, 0, 0)
 	phaseStart = time.Now()
 
+	// Apply platform-authoritative UNREGISTERED classifications.
+	// The platform operator may have marked agents as external cross-org dependencies
+	// via the Specter UI. These classifications take precedence over anything the
+	// scanner computed — apply them before the scope partition.
+	if platformCfg != nil {
+		for i := range result.Agents {
+			if platformCfg.IsExternal(result.Agents[i].ExternalID) {
+				result.Agents[i].VisibilityClass = types.VisibilityClassUnregistered
+				log.Printf("[scope] marked UNREGISTERED (platform-authoritative): %s", result.Agents[i].Name)
+			}
+		}
+	}
+
 	// Partition agents by governance scope using plugin-set VisibilityClass values.
 	// External agents (UNREGISTERED) are outside Specter's governance scope —
 	// they appear in the inventory but receive no governance findings.

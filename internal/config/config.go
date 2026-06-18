@@ -25,6 +25,12 @@ type SuppressedFinding struct {
 	SuppressedAt    time.Time `json:"suppressedAt"`
 }
 
+// ExternalAgent is an agent the platform operator has classified as UNREGISTERED
+// (external cross-org dependency). The scanner excludes these from governance analysis.
+type ExternalAgent struct {
+	ExternalID string `json:"externalId"`
+}
+
 // PlatformConfig is the response from GET /api/v1/scanner/config.
 type PlatformConfig struct {
 	OrgID               string              `json:"orgId"`
@@ -32,6 +38,36 @@ type PlatformConfig struct {
 	ScanIntervalMinutes int                 `json:"scanIntervalMinutes"`
 	Plugins             []PluginConfig      `json:"plugins"`
 	SuppressedFindings  []SuppressedFinding `json:"suppressedFindings"`
+	ExternalAgents      []ExternalAgent     `json:"externalAgents"`
+}
+
+// IsExternal returns true when the platform has classified this agent as UNREGISTERED.
+// Handles the "external:https://HOSTNAME" → "HOSTNAME" normalisation that the ingest
+// route applies when deduplicating cross-org agents against the existing DB record.
+func (pc *PlatformConfig) IsExternal(agentExternalID string) bool {
+	if pc == nil {
+		return false
+	}
+	// Normalise scanner ExternalIDs of the form "external:https://host.example.com/..."
+	// to bare hostnames, matching the form stored in the platform DB.
+	normalised := agentExternalID
+	for _, prefix := range []string{"external:https://", "external:http://"} {
+		if strings.HasPrefix(agentExternalID, prefix) {
+			// Extract just the hostname (drop path, port, query)
+			rest := strings.TrimPrefix(agentExternalID, prefix)
+			if idx := strings.IndexAny(rest, "/:?"); idx >= 0 {
+				rest = rest[:idx]
+			}
+			normalised = rest
+			break
+		}
+	}
+	for _, ea := range pc.ExternalAgents {
+		if ea.ExternalID == normalised || ea.ExternalID == agentExternalID {
+			return true
+		}
+	}
+	return false
 }
 
 // IsSuppressed returns true when the platform has suppressed this finding for this agent.
