@@ -178,7 +178,7 @@ func main() {
 	// Safety net: drop any finding that references an unknown agent stableId.
 	// This catches pipeline bugs loudly rather than letting orphan findings
 	// reach the platform or confuse the report.
-	result.Findings = validateFindings(result.Agents, result.Findings)
+	result.Findings = validateFindings(result.Agents, result.Findings, platformCfg)
 
 	// Assemble payload
 	payload := ingest.Assemble(
@@ -542,20 +542,35 @@ type combinedScanResult struct {
 // validateFindings removes findings with empty or dangling AgentStableID values.
 // Any finding that survives this check is guaranteed to have a corresponding
 // agent record in the payload; the platform rejects dangling references.
-func validateFindings(agents []types.CanonicalAgentRecord, findings []types.FindingRecord) []types.FindingRecord {
-	validStableIDs := make(map[string]string, len(agents))
+func validateFindings(
+	agents []types.CanonicalAgentRecord,
+	findings []types.FindingRecord,
+	platformCfg *config.PlatformConfig,
+) []types.FindingRecord {
+	validStableIDs := make(map[string]bool, len(agents))
+	stableToExternal := make(map[string]string, len(agents))
 	for _, a := range agents {
-		validStableIDs[a.StableID] = a.Name
+		validStableIDs[a.StableID] = true
+		stableToExternal[a.StableID] = a.ExternalID
 	}
-	out := findings[:0]
+	var out []types.FindingRecord
 	for _, f := range findings {
 		if f.AgentStableID == "" {
-			log.Printf("PIPELINE ERROR: finding %s has empty AgentStableID — dropping", f.RuleID)
+			log.Printf("PIPELINE WARNING: finding %s (agent=%s) has empty AgentStableID — dropping",
+				f.RuleID, f.AgentName)
 			continue
 		}
-		if _, ok := validStableIDs[f.AgentStableID]; !ok {
-			log.Printf("PIPELINE ERROR: finding %s references unknown AgentStableID %s — dropping", f.RuleID, f.AgentStableID)
+		if !validStableIDs[f.AgentStableID] {
+			log.Printf("PIPELINE WARNING: finding %s references unknown AgentStableID %s — dropping",
+				f.RuleID, f.AgentStableID)
 			continue
+		}
+		if platformCfg != nil {
+			externalID := stableToExternal[f.AgentStableID]
+			if platformCfg.IsSuppressed(externalID, f.RuleID) {
+				log.Printf("[govern] %s on %s suppressed by platform — skipping", f.RuleID, externalID)
+				continue
+			}
 		}
 		out = append(out, f)
 	}

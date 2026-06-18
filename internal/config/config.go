@@ -16,12 +16,35 @@ import (
 	"time"
 )
 
+// SuppressedFinding is a finding that the platform has suppressed via governance action.
+// The scanner must not generate this finding for this agent.
+type SuppressedFinding struct {
+	AgentExternalID string    `json:"agentExternalId"`
+	RuleID          string    `json:"ruleId"`
+	SuppressedBy    string    `json:"suppressedBy"`
+	SuppressedAt    time.Time `json:"suppressedAt"`
+}
+
 // PlatformConfig is the response from GET /api/v1/scanner/config.
 type PlatformConfig struct {
-	OrgID               string         `json:"orgId"`
-	SigningKey           string         `json:"signingKey"`
-	ScanIntervalMinutes int            `json:"scanIntervalMinutes"`
-	Plugins             []PluginConfig `json:"plugins"`
+	OrgID               string              `json:"orgId"`
+	SigningKey           string              `json:"signingKey"`
+	ScanIntervalMinutes int                 `json:"scanIntervalMinutes"`
+	Plugins             []PluginConfig      `json:"plugins"`
+	SuppressedFindings  []SuppressedFinding `json:"suppressedFindings"`
+}
+
+// IsSuppressed returns true when the platform has suppressed this finding for this agent.
+func (pc *PlatformConfig) IsSuppressed(agentExternalID, ruleID string) bool {
+	if pc == nil {
+		return false
+	}
+	for _, sf := range pc.SuppressedFindings {
+		if sf.AgentExternalID == agentExternalID && sf.RuleID == ruleID {
+			return true
+		}
+	}
+	return false
 }
 
 // PluginConfig represents one plugin entry in the platform config response.

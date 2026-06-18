@@ -119,8 +119,12 @@ func (a *Analyzer) Analyze(
 	}
 
 	// Intent-based findings: MISSING_INTENT_DECLARATION, INTENT_MISMATCH, INTENT_OWNER_ABSENT
+	// UNREGISTERED agents are external dependencies outside governance scope — skip.
 	for i := range agents {
 		ag := &agents[i]
+		if ag.VisibilityClass == types.VisibilityClassUnregistered {
+			continue
+		}
 		intentFindings := intentFindings(ag, now)
 		findings = append(findings, intentFindings...)
 	}
