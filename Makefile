@@ -1,4 +1,8 @@
-VERSION ?= dev
+# Customers should always build via `make build` (or use the official release
+# binary) so the report footer shows a real version string. A plain `go build`
+# with no -ldflags still falls back to "dev" (acceptable for local development
+# only) — see the Version var default in cmd/scanner/main.go.
+VERSION ?= 0.1.0
 GOFLAGS := -ldflags="-s -w -X main.Version=$(VERSION)"
 
 .PHONY: build build-all test test-demo sign release

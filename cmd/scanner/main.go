@@ -223,6 +223,13 @@ func main() {
 	)
 
 	if cfg.NoPlatform {
+		// Deduplicate by (AgentStableID, RuleID) — multiple analyzers can fire the
+		// same rule for the same agent via independent code paths (e.g. the AWS
+		// Bedrock intent check and staticref's intent check both emit
+		// MISSING_INTENT_DECLARATION). The platform's ingest path handles this via
+		// a DB unique constraint and must not be touched here; this dedup is
+		// standalone-report-only.
+		payload.Findings = deduplicateFindings(payload.Findings)
 		if err := writeStandaloneReport(cfg, payload, Version); err != nil {
 			log.Fatalf("write report: %v", err)
 		}
@@ -685,6 +692,22 @@ func computeVisibility(agent *types.CanonicalAgentRecord) types.VisibilityClass 
 	// SHADOW: high-confidence agent signal (framework/dependency) but no formal
 	// intent file and no detectable/declared deployment infrastructure.
 	return types.VisibilityClassShadow
+}
+
+// deduplicateFindings collapses duplicate findings keyed by (AgentStableID, RuleID).
+// When the same rule fires for the same agent from more than one analyzer code
+// path, only the first occurrence is kept. Standalone-report-only — see call site.
+func deduplicateFindings(findings []types.FindingRecord) []types.FindingRecord {
+	seen := make(map[string]bool)
+	out := make([]types.FindingRecord, 0, len(findings))
+	for _, f := range findings {
+		key := f.AgentStableID + "|" + f.RuleID
+		if !seen[key] {
+			seen[key] = true
+			out = append(out, f)
+		}
+	}
+	return out
 }
 
 // writeStandaloneReport generates a report file and prints a summary to stdout.

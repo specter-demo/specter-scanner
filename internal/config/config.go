@@ -189,8 +189,26 @@ type ScannerConfig struct {
 	Version string
 }
 
-// FileConfig maps the specter.yaml schema (spec section 7.8.2).
+// FileConfig maps the specter.yaml schema (spec section 7.8.2). Example:
+//
+//	org_slug: "my-company"
+//	plugins:
+//	  aws:
+//	    accounts: ["123456789012"]
+//	    regions: ["us-east-1"]
+//	    role_arn: "arn:aws:iam::123456789012:role/SecurityAudit"
+//	  github:
+//	    org: "my-company"
+//	    token_env: "GITHUB_TOKEN"
+//	output:
+//	  format: html
+//	  path: "./reports/scan-{date}.html"
+//	  min_severity: medium
 type FileConfig struct {
+	// OrgSlug identifies the scanning org for cross-org checks (e.g. A2A_CROSS_ORG).
+	// Equivalent to --org-slug; the CLI flag always takes precedence if passed.
+	OrgSlug string `yaml:"org_slug"`
+
 	Plugins struct {
 		AWS struct {
 			Accounts []string `yaml:"accounts"`
@@ -284,6 +302,11 @@ func Parse() *ScannerConfig {
 		cfg.ConfigFile = configPath
 		log.Printf("[config] loaded %s", configPath)
 
+		if !explicitFlags["org-slug"] && fileCfg.OrgSlug != "" {
+			cfg.OrgSlug = fileCfg.OrgSlug
+			log.Printf("[config] org_slug from file: %s", cfg.OrgSlug)
+		}
+
 		if !explicitFlags["aws-region"] && len(fileCfg.Plugins.AWS.Regions) > 0 {
 			cfg.AWSRegion = fileCfg.Plugins.AWS.Regions[0]
 			log.Printf("[config] aws.regions from file: %v (using %s)", fileCfg.Plugins.AWS.Regions, cfg.AWSRegion)
@@ -326,6 +349,14 @@ func Parse() *ScannerConfig {
 	}
 	if cfg.OrgID == "" {
 		cfg.OrgID = "demo-org"
+	}
+
+	// If OrgID fell all the way through to the literal "demo-org" placeholder
+	// and the user supplied an org_slug (file or flag), use that instead — it's
+	// a real, human-meaningful identifier and is what should appear in the
+	// standalone report header rather than a generic placeholder.
+	if cfg.OrgID == "demo-org" && cfg.OrgSlug != "" {
+		cfg.OrgID = cfg.OrgSlug
 	}
 
 	return cfg
