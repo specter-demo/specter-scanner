@@ -472,7 +472,10 @@ footer {
 /* ── Print stylesheet (used by the Download PDF button via window.print()) ── */
 @media print {
   @page {
-    margin: 1.5cm;
+    margin: 0;
+  }
+  body {
+    padding: 1.5cm;
   }
   #themeToggle, #downloadBtn { display: none; }
   body { background: #fff; color: #000; }
