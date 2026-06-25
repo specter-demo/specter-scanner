@@ -157,6 +157,17 @@ func (a *Analyzer) analyzeAgent(ctx context.Context, agent *types.CanonicalAgent
 	card.Raw = body
 	agent.A2ACard = &card
 
+	// Use the card's human-readable name as the agent's display name when the
+	// current name was never set from a human-readable source. EXTERNAL_HTTP is
+	// the platform value the AWS plugin assigns when it creates a placeholder
+	// agent record from a raw discovered URL (Name = hostname) — that's exactly
+	// the case where the card's name is real signal worth adopting. This is
+	// generic: it applies to any external agent with a named card, not a
+	// hardcoded org or agent.
+	if card.Name != "" && agent.Platform == "EXTERNAL_HTTP" {
+		agent.Name = card.Name
+	}
+
 	// Check 2: Signature
 	sig := resp.Header.Get("X-Specter-Signature")
 	if sig == "" && !card.Signed {
