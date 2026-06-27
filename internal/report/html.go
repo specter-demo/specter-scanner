@@ -515,7 +515,9 @@ footer {
   body { background: #fff; color: #000; }
   .finding { page-break-inside: avoid; }
   .metric  { page-break-inside: avoid; }
-  :root {
+  :root, [data-theme="dark"] {
+    print-color-adjust: exact;
+    -webkit-print-color-adjust: exact;
     --bg: #FFFFFF; --surface: #F8F8F8; --surface2: #F0F2F7;
     --border: #E0E0EA; --text: #0C0C10; --text2: #46465A; --text3: #84849A;
   }
