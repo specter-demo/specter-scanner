@@ -118,6 +118,39 @@ func (p *Plugin) HealthCheck(ctx context.Context) error {
 	return err
 }
 
+// credentialErrorSignatures are substrings of AWS SDK error messages that
+// indicate an authentication/credential failure, as opposed to a successful
+// call that simply found zero results. Matched against err.Error() since the
+// SDK wraps the underlying API error code into the error string.
+var credentialErrorSignatures = []string{
+	"InvalidClientTokenId",
+	"UnrecognizedClientException",
+	"ExpiredToken",
+	"InvalidGrantException",
+	"NoCredentialProviders",
+	"could not find AWS credentials",
+	"SignatureDoesNotMatch",
+	"AuthFailure",
+}
+
+// isCredentialError reports whether err looks like an authentication failure
+// (bad/expired/missing credentials) rather than a permissions or transient
+// network error. Used to distinguish "every plugin call failed because
+// credentials are broken" (no report should be written) from "credentials
+// are fine, the account just has zero agents" (a valid empty-result scan).
+func isCredentialError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	for _, sig := range credentialErrorSignatures {
+		if strings.Contains(msg, sig) {
+			return true
+		}
+	}
+	return false
+}
+
 func (p *Plugin) Scan(ctx context.Context) (*plugin.ScanResult, error) {
 	cfg, err := p.loadAWSConfig(ctx)
 	if err != nil {
@@ -126,11 +159,13 @@ func (p *Plugin) Scan(ctx context.Context) (*plugin.ScanResult, error) {
 	p.awsConf = cfg
 
 	result := &plugin.ScanResult{}
+	var subErrs []error
 
 	// Step 1: Scan Lambda functions
 	lambdaAgents, lambdaFindings, lambdaRefs, err := p.scanLambda(ctx)
 	if err != nil {
 		log.Printf("aws: lambda scan error: %v", err)
+		subErrs = append(subErrs, err)
 	}
 	result.Agents = append(result.Agents, lambdaAgents...)
 	result.Findings = append(result.Findings, lambdaFindings...)
@@ -140,6 +175,7 @@ func (p *Plugin) Scan(ctx context.Context) (*plugin.ScanResult, error) {
 	ecsAgents, ecsFindings, ecsRefs, err := p.scanECS(ctx)
 	if err != nil {
 		log.Printf("aws: ecs scan error: %v", err)
+		subErrs = append(subErrs, err)
 	}
 	result.Agents = append(result.Agents, ecsAgents...)
 	result.Findings = append(result.Findings, ecsFindings...)
@@ -149,9 +185,27 @@ func (p *Plugin) Scan(ctx context.Context) (*plugin.ScanResult, error) {
 	bedrockAgents, bedrockFindings, err := p.scanBedrock(ctx)
 	if err != nil {
 		log.Printf("aws: bedrock scan error: %v", err)
+		subErrs = append(subErrs, err)
 	}
 	result.Agents = append(result.Agents, bedrockAgents...)
 	result.Findings = append(result.Findings, bedrockFindings...)
+
+	// If every sub-scan that ran failed with a credential error and nothing
+	// was discovered, this is an authentication failure, not a clean empty
+	// account — surface it as an error instead of letting Scan() return a
+	// zero-agent result that looks identical to a valid empty scan.
+	if len(result.Agents) == 0 && len(subErrs) > 0 {
+		allCredentialErrors := true
+		for _, e := range subErrs {
+			if !isCredentialError(e) {
+				allCredentialErrors = false
+				break
+			}
+		}
+		if allCredentialErrors {
+			return result, &plugin.AuthError{PluginName: "aws", Err: subErrs[0]}
+		}
+	}
 
 	// Step 4: IAM role provenance for all discovered agents
 	iamFindings, err := p.scanIAMProvenance(ctx, result.Agents)

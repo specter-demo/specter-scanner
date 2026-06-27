@@ -11,6 +11,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -223,6 +224,18 @@ func main() {
 	)
 
 	if cfg.NoPlatform {
+		// If every plugin that was configured to run failed with an
+		// authentication error, do not write a report. A clean empty-agent
+		// report in this situation would look identical to a valid scan of
+		// an empty environment, and an engineer with expired credentials
+		// would get a silent false all-clear — the industry-standard
+		// behavior (Trivy, Grype, etc.) is to fail loudly instead.
+		if allPluginsFailed(result) {
+			fmt.Fprintf(os.Stderr, "ERROR: Scan failed — no plugins completed successfully.\n")
+			fmt.Fprintf(os.Stderr, "Check your AWS credentials (aws sso login) and GitHub token.\n")
+			os.Exit(2) // exit 2 = scan error, distinct from exit 1 = CRITICAL findings found
+		}
+
 		// Deduplicate by (AgentStableID, RuleID) — multiple analyzers can fire the
 		// same rule for the same agent via independent code paths (e.g. the AWS
 		// Bedrock intent check and staticref's intent check both emit
@@ -456,8 +469,13 @@ func runScan(ctx context.Context, cfg *config.ScannerConfig, scanID string, plat
 		wg.Wait()
 		close(resultCh)
 		for pr := range resultCh {
+			combined.PluginsRun = append(combined.PluginsRun, pr.name)
 			if pr.err != nil {
 				log.Printf("plugin %s error: %v", pr.name, pr.err)
+				var authErr *plugin.AuthError
+				if errors.As(pr.err, &authErr) {
+					combined.PluginsFailed = append(combined.PluginsFailed, pr.name)
+				}
 				continue
 			}
 			if pr.result == nil {
@@ -505,6 +523,8 @@ func runScan(ctx context.Context, cfg *config.ScannerConfig, scanID string, plat
 				return nil, fmt.Errorf("marshal github config for phase 2: %w", err)
 			}
 		}
+		combined.PluginsRun = append(combined.PluginsRun, "github")
+
 		if err := githubPlugin.Configure(plugin.PluginConfig{
 			OrgID:      cfg.OrgID,
 			OrgSlug:    cfg.OrgSlug,
@@ -522,6 +542,10 @@ func runScan(ctx context.Context, cfg *config.ScannerConfig, scanID string, plat
 			log.Printf("plugin github: done in %v", time.Since(start))
 			if err != nil {
 				log.Printf("plugin github error: %v", err)
+				var authErr *plugin.AuthError
+				if errors.As(err, &authErr) {
+					combined.PluginsFailed = append(combined.PluginsFailed, "github")
+				}
 				postPhaseUpdate(cfg, scanID, "GITHUB_ENRICHMENT", "FAILED", err.Error(), 0, len(combined.Findings), int(time.Since(ghPhaseStart).Milliseconds()))
 			} else if r != nil {
 				// Enrich Phase 1 agents in-place with GitHub data (intent, alignment,
@@ -575,6 +599,22 @@ type combinedScanResult struct {
 	Events     []types.NormalizedEvent
 	Findings   []types.FindingRecord
 	StaticRefs []types.StaticRef
+
+	// PluginsRun and PluginsFailed track which configured plugins executed
+	// and which of those failed with an authentication error (plugin.AuthError),
+	// as distinct from a plugin that ran successfully and simply found zero
+	// results. Used by allPluginsFailed to decide whether a report should be
+	// written at all — see Fix 1 in cmd/scanner/main.go's NoPlatform path.
+	PluginsRun    []string
+	PluginsFailed []string
+}
+
+// allPluginsFailed reports whether every plugin that was configured to run
+// failed with an authentication error. A scan where no plugins were
+// configured at all is not treated as a failure here (that's a config
+// problem caught earlier, before any plugin runs).
+func allPluginsFailed(r *combinedScanResult) bool {
+	return len(r.PluginsRun) > 0 && len(r.PluginsFailed) == len(r.PluginsRun)
 }
 
 // validateFindings removes findings with empty or dangling AgentStableID values.

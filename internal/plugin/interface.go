@@ -8,6 +8,7 @@ package plugin
 import (
 	"context"
 	"errors"
+	"fmt"
 	"time"
 
 	"github.com/specter-demo/specter-scanner/internal/types"
@@ -15,6 +16,24 @@ import (
 
 // ErrNotSupported is returned by streaming methods in MVP (batch-only mode).
 var ErrNotSupported = errors.New("not supported in MVP")
+
+// AuthError is returned by a plugin's Scan method when the plugin could not
+// authenticate at all (expired/missing/invalid credentials), as distinct
+// from a successful scan that simply found zero results. The caller (the
+// scanner's main loop) uses this to decide whether a report should be
+// written: a clean empty scan is valid and gets a report; a total
+// authentication failure must not produce one (see allPluginsFailed in
+// cmd/scanner/main.go).
+type AuthError struct {
+	PluginName string
+	Err        error
+}
+
+func (e *AuthError) Error() string {
+	return fmt.Sprintf("%s: authentication failed: %v", e.PluginName, e.Err)
+}
+
+func (e *AuthError) Unwrap() error { return e.Err }
 
 // PluginConfig contains the configuration for a plugin instance.
 type PluginConfig struct {

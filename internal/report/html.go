@@ -28,6 +28,12 @@ type ReportData struct {
 	LowCount      int
 	TotalFindings int
 
+	// Classification breakdown by governance state, shown beneath the metric
+	// tiles. Computed from each agent's VisibilityClass in buildReportData.
+	ShadowCount     int
+	DiscoveredCount int
+	GovernedCount   int
+
 	Agents   []AgentRow
 	Findings []FindingRow
 }
@@ -89,6 +95,7 @@ func buildReportData(payload types.ScanPayload, version string) ReportData {
 	// Build agent rows
 	agents := make([]AgentRow, 0, len(payload.Agents))
 	shadowCount := 0
+	classCounts := map[types.VisibilityClass]int{}
 	for _, a := range payload.Agents {
 		row := AgentRow{
 			Name:            a.Name,
@@ -104,6 +111,7 @@ func buildReportData(payload types.ScanPayload, version string) ReportData {
 		if a.IsShadow {
 			shadowCount++
 		}
+		classCounts[a.VisibilityClass]++
 	}
 	// Sort by risk score descending
 	sort.Slice(agents, func(i, j int) bool { return agents[i].RiskScore > agents[j].RiskScore })
@@ -141,13 +149,16 @@ func buildReportData(payload types.ScanPayload, version string) ReportData {
 		Version:       version,
 		OrgID:         orgID,
 		ScanID:        payload.ScanID,
-		TotalAgents:   len(payload.Agents),
-		ShadowAgents:  shadowCount,
-		CriticalCount: sevCount["CRITICAL"],
-		HighCount:     sevCount["HIGH"],
-		MediumCount:   sevCount["MEDIUM"],
-		LowCount:      sevCount["LOW"],
-		TotalFindings: len(payload.Findings),
+		TotalAgents:     len(payload.Agents),
+		ShadowAgents:    shadowCount,
+		CriticalCount:   sevCount["CRITICAL"],
+		HighCount:       sevCount["HIGH"],
+		MediumCount:     sevCount["MEDIUM"],
+		LowCount:        sevCount["LOW"],
+		TotalFindings:   len(payload.Findings),
+		ShadowCount:     classCounts[types.VisibilityClassShadow],
+		DiscoveredCount: classCounts[types.VisibilityClassDiscovered],
+		GovernedCount:   classCounts[types.VisibilityClassGoverned],
 		Agents:        agents,
 		Findings:      findings,
 	}
@@ -316,6 +327,29 @@ header {
   letter-spacing: 0.14em;
   text-transform: uppercase;
   color: var(--text3);
+}
+
+/* ── Classification breakdown (between metric tiles and agent inventory) ── */
+.class-breakdown {
+  max-width: 1280px;
+  margin: 0 auto 32px;
+  padding: 0 32px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+.class-breakdown .sep { color: var(--text3); margin: 0 8px; font-weight: 400; }
+.class-breakdown .shadow     { color: var(--critical); }
+.class-breakdown .discovered { color: var(--high); }
+.class-breakdown .governed   { color: var(--low); }
+
+/* ── Risk score footnote ── */
+.risk-footnote {
+  font-size: 11px;
+  color: var(--text3);
+  margin-top: 10px;
+  line-height: 1.5;
 }
 
 /* ── Sections ── */
@@ -530,6 +564,10 @@ footer {
   </div>
 </div>
 
+<div class="class-breakdown">
+  <span class="shadow">{{.ShadowCount}} SHADOW</span><span class="sep">·</span><span class="discovered">{{.DiscoveredCount}} DISCOVERED</span><span class="sep">·</span><span class="governed">{{.GovernedCount}} GOVERNED</span>
+</div>
+
 <div class="container">
 
   <!-- ── Agent Inventory ── -->
@@ -542,7 +580,7 @@ footer {
             <th>Agent</th>
             <th>Platform</th>
             <th>Visibility</th>
-            <th>Risk</th>
+            <th title="Risk score (0&ndash;100) is calculated from four factors: permission breadth (40%), shadow status (30%), credential type (20%), and recent activity (10%).">Risk</th>
             <th>Framework</th>
             <th>Findings</th>
           </tr>
@@ -574,6 +612,10 @@ footer {
           {{end}}
         </tbody>
       </table>
+    </div>
+    <div class="risk-footnote">
+      Risk scores reflect the agent&rsquo;s permission breadth, governance status,
+      credential type, and activity. Scores above 75 indicate critical risk.
     </div>
   </section>
 

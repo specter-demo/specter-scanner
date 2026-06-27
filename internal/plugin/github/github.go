@@ -60,6 +60,28 @@ func init() {
 	plugin.Register(&Plugin{})
 }
 
+// credentialErrorSignatures are substrings of go-github/HTTP error messages
+// that indicate an authentication failure (bad/expired/missing token), as
+// opposed to a successful call that simply found zero results.
+var credentialErrorSignatures = []string{
+	"401",
+	"Bad credentials",
+	"Requires authentication",
+}
+
+func isCredentialError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	for _, sig := range credentialErrorSignatures {
+		if strings.Contains(msg, sig) {
+			return true
+		}
+	}
+	return false
+}
+
 func (p *Plugin) Name() string { return "github" }
 
 func (p *Plugin) Configure(cfg plugin.PluginConfig) error {
@@ -209,7 +231,11 @@ func (p *Plugin) Scan(ctx context.Context) (*plugin.ScanResult, error) {
 	for {
 		repos, resp, err := client.Repositories.ListByOrg(ctx, p.ghCfg.Org, opts)
 		if err != nil {
-			return nil, fmt.Errorf("github: ListByOrg: %w", err)
+			wrapped := fmt.Errorf("github: ListByOrg: %w", err)
+			if isCredentialError(err) {
+				return nil, &plugin.AuthError{PluginName: "github", Err: wrapped}
+			}
+			return nil, wrapped
 		}
 
 		for _, repo := range repos {
