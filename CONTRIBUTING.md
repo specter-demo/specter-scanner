@@ -66,6 +66,11 @@ Finding rules detect specific security or governance gaps. To add a new rule:
 4. Add the rule to the findings table in `README.md`
 5. Document the remediation path in the finding description
 
+## Known gaps
+
+- **`internal/types/findings.go` does not exist.** The "Adding a new finding rule" section above references it as the canonical rule-ID registry, but rule IDs are currently just string literals scattered across each plugin file (e.g. `internal/plugin/aws/aws.go`, `internal/plugin/aws/cicd.go`). This is pre-existing documentation drift, not a recent regression — either adding the real registry file or fixing this doc is a good follow-up for anyone touching finding rules.
+- **The GitHub plugin (`internal/plugin/github/github.go`) has zero unit test coverage.** Every other plugin's tests (see `internal/plugin/aws/aws_test.go`, `cicd_test.go`, `org_sso_test.go`) follow the bar described in "Adding a new plugin" above; the GitHub plugin does not yet meet it. This is a good first contribution — no design questions involved, just apply the same happy-path/empty-result/error-case pattern already established in the AWS plugin's tests.
+
 ## Pull request process
 
 1. Fork the repository
