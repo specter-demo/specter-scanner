@@ -203,7 +203,7 @@ func main() {
 	result.Agents = append(result.Agents, externalAgents...)
 
 	// Delegation chain reconstruction — governed agents only.
-	chains := chain.Reconstruct(governedAgents, result.Edges, result.Events)
+	chains := chain.Reconstruct(governedAgents, result.Edges, result.Events, result.ConfirmedHumanPrincipals)
 
 	postPhaseUpdate(cfg, scanID, "CLASSIFICATION", "COMPLETE", "", len(result.Agents), len(result.Findings), int(time.Since(phaseStart).Milliseconds()))
 
@@ -270,12 +270,12 @@ func postPhaseUpdate(cfg *config.ScannerConfig, scanID, phase, status, message s
 	}
 
 	body := map[string]interface{}{
-		"phase":        phase,
-		"status":       status,
-		"message":      message,
-		"agentsFound":  agentsFound,
+		"phase":         phase,
+		"status":        status,
+		"message":       message,
+		"agentsFound":   agentsFound,
 		"findingsFound": findingsFound,
-		"durationMs":   durationMs,
+		"durationMs":    durationMs,
 	}
 	data, err := json.Marshal(body)
 	if err != nil {
@@ -486,6 +486,14 @@ func runScan(ctx context.Context, cfg *config.ScannerConfig, scanID string, plat
 			combined.Events = append(combined.Events, pr.result.Events...)
 			combined.Findings = append(combined.Findings, pr.result.Findings...)
 			combined.StaticRefs = append(combined.StaticRefs, pr.result.StaticRefs...)
+			if len(pr.result.ConfirmedHumanPrincipals) > 0 {
+				if combined.ConfirmedHumanPrincipals == nil {
+					combined.ConfirmedHumanPrincipals = make(map[string]bool, len(pr.result.ConfirmedHumanPrincipals))
+				}
+				for k, v := range pr.result.ConfirmedHumanPrincipals {
+					combined.ConfirmedHumanPrincipals[k] = v
+				}
+			}
 		}
 	}
 
@@ -600,6 +608,11 @@ type combinedScanResult struct {
 	Findings   []types.FindingRecord
 	StaticRefs []types.StaticRef
 
+	// ConfirmedHumanPrincipals merges every plugin's
+	// plugin.ScanResult.ConfirmedHumanPrincipals — see that field's doc
+	// comment. Only the AWS plugin populates it today.
+	ConfirmedHumanPrincipals map[string]bool
+
 	// PluginsRun and PluginsFailed track which configured plugins executed
 	// and which of those failed with an authentication error (plugin.AuthError),
 	// as distinct from a plugin that ran successfully and simply found zero
@@ -625,11 +638,11 @@ func allPluginsFailed(r *combinedScanResult) bool {
 // Specter's governance scope. The scope partition in the CLASSIFICATION phase is
 // the primary mechanism; Gate 3 here is defense-in-depth.
 var governanceFindingTypes = map[string]bool{
-	"MISSING_INTENT_DECLARATION":        true,
+	"MISSING_INTENT_DECLARATION":         true,
 	"MISSING_INTENT_DECLARATION_BEDROCK": true,
-	"INTENT_OWNER_ABSENT":               true,
-	"INTENT_MISMATCH":                   true,
-	"NHI_ORPHANED_CREATOR":              true,
+	"INTENT_OWNER_ABSENT":                true,
+	"INTENT_MISMATCH":                    true,
+	"NHI_ORPHANED_CREATOR":               true,
 }
 
 func validateFindings(
@@ -796,9 +809,9 @@ func writeStandaloneReport(cfg *config.ScannerConfig, payload types.ScanPayload,
 
 	// Print summary to stdout
 	criticalCount := report.CountBySeverity(payload.Findings, "CRITICAL")
-	highCount     := report.CountBySeverity(payload.Findings, "HIGH")
-	mediumCount   := report.CountBySeverity(payload.Findings, "MEDIUM")
-	lowCount      := report.CountBySeverity(payload.Findings, "LOW")
+	highCount := report.CountBySeverity(payload.Findings, "HIGH")
+	mediumCount := report.CountBySeverity(payload.Findings, "MEDIUM")
+	lowCount := report.CountBySeverity(payload.Findings, "LOW")
 
 	fmt.Printf("\nSpecter Scanner — Scan Complete\n")
 	fmt.Printf("════════════════════════════════\n")

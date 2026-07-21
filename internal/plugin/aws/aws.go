@@ -251,12 +251,13 @@ func (p *Plugin) Scan(ctx context.Context) (*plugin.ScanResult, error) {
 	result.Findings = append(result.Findings, cicdFindings...)
 
 	// Step 7: Organizations + IAM Identity Center
-	orgAgents, orgFindings, err := p.scanOrgAndSSO(ctx, result.Agents)
+	orgAgents, orgFindings, confirmedHumanPrincipals, err := p.scanOrgAndSSO(ctx, result.Agents, events)
 	if err != nil {
 		log.Printf("aws: org/sso scan error: %v", err)
 	}
 	result.Agents = append(result.Agents, orgAgents...)
 	result.Findings = append(result.Findings, orgFindings...)
+	result.ConfirmedHumanPrincipals = confirmedHumanPrincipals
 
 	// Detect behavioral ephemeral spawns
 	// Exclude the scanner's own session ARN to avoid self-detection false positives
@@ -1519,7 +1520,7 @@ func normalizeCloudTrailEvent(event cloudtrailtypes.Event) *types.NormalizedEven
 		ne.Timestamp = *event.EventTime
 	}
 
-	ne.Principal = extractPrincipal(ct.UserIdentity, ct.EventSource)
+	ne.Principal = extractPrincipal(ct.UserIdentity)
 
 	if ct.EventName == "AssumeRole" {
 		if role, ok := ct.ResponseElements["assumedRoleUser"].(map[string]interface{}); ok {
@@ -1532,21 +1533,47 @@ func normalizeCloudTrailEvent(event cloudtrailtypes.Event) *types.NormalizedEven
 	return ne
 }
 
-func extractPrincipal(identity map[string]interface{}, eventSource string) types.Principal {
+// awsReservedSSORolePrefix is the exact substring every IAM Identity
+// Center (AWS SSO) federated session's assumed-role ARN carries — AWS
+// generates these role names itself, e.g.
+// arn:aws:sts::ACCOUNT:assumed-role/AWSReservedSSO_AdministratorAccess_<hash>/<username>.
+// Confirmed against a real live SSO session's CloudTrail userIdentity.arn,
+// not assumed from documentation.
+const awsReservedSSORolePrefix = ":assumed-role/AWSReservedSSO_"
+
+// eventBridgeServicePrincipal is the AWS service principal for
+// EventBridge/CloudWatch Events, as it appears in
+// userIdentity.invokedBy when EventBridge calls another service on the
+// caller's behalf. This is the same literal value already used
+// elsewhere in this file for the (incorrect) eventSource-based check;
+// confirmed live that invokedBy itself is real and populated with
+// bare service-principal strings (observed "lambda.amazonaws.com" and
+// "fas.s3.amazonaws.com" in this account's CloudTrail) — no live
+// EventBridge-invoked example was available to observe directly, since
+// EventBridge-triggered Lambda invocations are data-plane events not
+// captured by CloudTrail's management-event LookupEvents API.
+const eventBridgeServicePrincipal = "events.amazonaws.com"
+
+func extractPrincipal(identity map[string]interface{}) types.Principal {
 	if identity == nil {
 		return types.Principal{Type: "SYSTEM"}
 	}
 	iType, _ := identity["type"].(string)
 	arn, _ := identity["arn"].(string)
 	userName, _ := identity["userName"].(string)
+	invokedBy, _ := identity["invokedBy"].(string)
 
 	pr := types.Principal{
 		ID:   arn,
 		Name: userName,
 	}
 
-	// EventBridge/CloudWatch Events scheduler
-	if strings.Contains(eventSource, "events.amazonaws.com") {
+	// EventBridge/CloudWatch Events scheduler. CloudTrail records which
+	// service made a call on the caller's behalf in userIdentity.invokedBy
+	// — not in the event's own eventSource, which is always the API being
+	// called (e.g. "sts.amazonaws.com" for the AssumeRole an EventBridge
+	// invocation triggers internally), never the triggering service.
+	if strings.Contains(invokedBy, eventBridgeServicePrincipal) {
 		pr.Type = "SCHEDULER"
 		return pr
 	}
@@ -1555,8 +1582,10 @@ func extractPrincipal(identity map[string]interface{}, eventSource string) types
 	case "IAMUser":
 		pr.Type = "HUMAN"
 	case "AssumedRole":
-		if strings.Contains(arn, "events.amazonaws.com") {
-			pr.Type = "SCHEDULER"
+		if strings.Contains(arn, awsReservedSSORolePrefix) {
+			// IAM Identity Center federated human session, not an agent's
+			// own execution role.
+			pr.Type = "HUMAN"
 		} else {
 			pr.Type = "AGENT"
 		}

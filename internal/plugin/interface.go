@@ -62,6 +62,14 @@ type ScanResult struct {
 	Events     []types.NormalizedEvent // for chain reconstruction
 	Findings   []types.FindingRecord   // plugin-level findings
 	StaticRefs []types.StaticRef       // for static reference analysis (Phase 11.5)
+
+	// ConfirmedHumanPrincipals optionally maps a principal ID (e.g. an
+	// assumed-role ARN) to true when a platform-specific authoritative
+	// source (AWS IAM Identity Center, for the AWS plugin) has confirmed
+	// that principal is human. Passed through to chain.Reconstruct to
+	// override its own CloudTrail-based inference for that principal. Most
+	// plugins leave this nil, same as Events.
+	ConfirmedHumanPrincipals map[string]bool
 }
 
 // ScanPlugin is the interface every plugin must implement.

@@ -111,3 +111,52 @@ func TestIsAssigned_HasAssignments(t *testing.T) {
 }
 
 func strPtr(s string) *string { return &s }
+
+// ── resolveHumanPrincipals / ssoPermissionSetNameFromARN ──────────────────────
+
+func TestSsoPermissionSetNameFromARN_ValidSSOArn(t *testing.T) {
+	arn := "arn:aws:sts::111111111111:assumed-role/AWSReservedSSO_AdministratorAccess_abc123def456/jane.doe"
+	name, ok := ssoPermissionSetNameFromARN(arn)
+	if !ok {
+		t.Fatal("expected ok=true for a valid AWSReservedSSO_ ARN")
+	}
+	if name != "AdministratorAccess" {
+		t.Errorf("expected permission set name %q, got %q", "AdministratorAccess", name)
+	}
+}
+
+func TestSsoPermissionSetNameFromARN_MultiWordPermissionSetName(t *testing.T) {
+	arn := "arn:aws:sts::111111111111:assumed-role/AWSReservedSSO_ReadOnlyAccess_789xyz012/john.smith"
+	name, ok := ssoPermissionSetNameFromARN(arn)
+	if !ok {
+		t.Fatal("expected ok=true for a valid AWSReservedSSO_ ARN")
+	}
+	if name != "ReadOnlyAccess" {
+		t.Errorf("expected permission set name %q, got %q", "ReadOnlyAccess", name)
+	}
+}
+
+func TestSsoPermissionSetNameFromARN_NonSSORole(t *testing.T) {
+	arn := "arn:aws:sts::111111111111:assumed-role/example-agent-execution-role/example-session-id"
+	_, ok := ssoPermissionSetNameFromARN(arn)
+	if ok {
+		t.Error("expected ok=false for a non-SSO agent role ARN")
+	}
+}
+
+func TestSsoPermissionSetNameFromARN_EmptyString(t *testing.T) {
+	_, ok := ssoPermissionSetNameFromARN("")
+	if ok {
+		t.Error("expected ok=false for an empty string")
+	}
+}
+
+func TestSsoPermissionSetNameFromARN_MalformedNoUnderscore(t *testing.T) {
+	// AWSReservedSSO_ prefix present, but nothing shaped like
+	// "<name>_<hash>" after it — no underscore to split on at all.
+	arn := "arn:aws:sts::111111111111:assumed-role/AWSReservedSSO_/jane.doe"
+	_, ok := ssoPermissionSetNameFromARN(arn)
+	if ok {
+		t.Error("expected ok=false when there's no _<hash> suffix to split off")
+	}
+}

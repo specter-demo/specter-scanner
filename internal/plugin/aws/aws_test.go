@@ -391,3 +391,78 @@ func TestAppendSecretsManagerWildcardFinding_NoMatchingAction(t *testing.T) {
 		t.Errorf("expected no finding when no permission is a secretsmanager:GetSecretValue grant, got %d", len(findings))
 	}
 }
+
+// ── extractPrincipal classification ───────────────────────────────────────────
+//
+// TestExtractPrincipal_InvokedByEventBridge is a regression test for the
+// SCHEDULER root-cause fix: CloudTrail records which service made a call
+// on the caller's behalf in userIdentity.invokedBy, not in the event's own
+// eventSource (which is always the API being called). The old
+// eventSource-based check could never fire for this reason.
+func TestExtractPrincipal_InvokedByEventBridge(t *testing.T) {
+	identity := map[string]interface{}{
+		"type":      "AWSService",
+		"invokedBy": "events.amazonaws.com",
+	}
+	pr := extractPrincipal(identity)
+	if pr.Type != "SCHEDULER" {
+		t.Errorf("expected Type=SCHEDULER when userIdentity.invokedBy is events.amazonaws.com, got %q", pr.Type)
+	}
+}
+
+func TestExtractPrincipal_InvokedByOtherService_NotScheduler(t *testing.T) {
+	identity := map[string]interface{}{
+		"type":      "AWSService",
+		"invokedBy": "lambda.amazonaws.com",
+	}
+	pr := extractPrincipal(identity)
+	if pr.Type == "SCHEDULER" {
+		t.Errorf("expected a non-EventBridge invokedBy to NOT classify as SCHEDULER, got %q", pr.Type)
+	}
+}
+
+// TestExtractPrincipal_SSOAssumedRoleIsHuman is a regression test for the
+// second classification bug: an IAM Identity Center (AWS SSO) federated
+// session shows up in CloudTrail as userIdentity.type == AssumedRole, and
+// was being swept into AGENT alongside real agent execution roles. The ARN
+// shape here (assumed-role/AWSReservedSSO_<PermissionSet>_<hash>/<user>)
+// matches this account's real CloudTrail data, not a guessed format.
+func TestExtractPrincipal_SSOAssumedRoleIsHuman(t *testing.T) {
+	identity := map[string]interface{}{
+		"type": "AssumedRole",
+		"arn":  "arn:aws:sts::111111111111:assumed-role/AWSReservedSSO_AdministratorAccess_abc123def456/jane.doe",
+	}
+	pr := extractPrincipal(identity)
+	if pr.Type != "HUMAN" {
+		t.Errorf("expected Type=HUMAN for an IAM Identity Center SSO AssumedRole session, got %q", pr.Type)
+	}
+}
+
+// TestExtractPrincipal_NonSSOAssumedRoleIsStillAgent confirms the SSO fix
+// doesn't over-broaden: a genuine agent execution role assumption (no
+// AWSReservedSSO_ in the role name) must still classify as AGENT.
+func TestExtractPrincipal_NonSSOAssumedRoleIsStillAgent(t *testing.T) {
+	identity := map[string]interface{}{
+		"type": "AssumedRole",
+		"arn":  "arn:aws:sts::111111111111:assumed-role/example-agent-execution-role/example-session-id",
+	}
+	pr := extractPrincipal(identity)
+	if pr.Type != "AGENT" {
+		t.Errorf("expected Type=AGENT for a non-SSO AssumedRole session (a real agent role), got %q", pr.Type)
+	}
+}
+
+func TestExtractPrincipal_IAMUserIsHuman(t *testing.T) {
+	identity := map[string]interface{}{"type": "IAMUser", "arn": "arn:aws:iam::111111111111:user/jane.doe"}
+	pr := extractPrincipal(identity)
+	if pr.Type != "HUMAN" {
+		t.Errorf("expected Type=HUMAN for an IAMUser principal, got %q", pr.Type)
+	}
+}
+
+func TestExtractPrincipal_NilIdentity(t *testing.T) {
+	pr := extractPrincipal(nil)
+	if pr.Type != "SYSTEM" {
+		t.Errorf("expected Type=SYSTEM for a nil identity map, got %q", pr.Type)
+	}
+}

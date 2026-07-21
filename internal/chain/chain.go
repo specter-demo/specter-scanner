@@ -17,10 +17,19 @@ const maxHops = 2
 
 // Reconstruct builds delegation chains from agent edges and events.
 // It returns a slice of DelegationChainRecord (one per root agent).
+//
+// confirmedHumanPrincipals optionally maps a principal ID (e.g. an
+// assumed-role ARN) to true when a platform-specific authoritative source
+// (AWS IAM Identity Center, for the AWS plugin) has confirmed that
+// principal is human — overriding hasHumanPrincipal's own CloudTrail-based
+// inference for that specific principal. A nil map (or a principal absent
+// from it) falls back to CloudTrail inference entirely; this must never be
+// used to assert a principal is NOT human, only to confirm when it is.
 func Reconstruct(
 	agents []types.CanonicalAgentRecord,
 	edges []types.AgentEdgeRecord,
 	events []types.NormalizedEvent,
+	confirmedHumanPrincipals map[string]bool,
 ) []types.DelegationChainRecord {
 	now := time.Now().UTC()
 	agentByID := make(map[string]*types.CanonicalAgentRecord, len(agents))
@@ -51,7 +60,7 @@ func Reconstruct(
 			continue
 		}
 
-		chain := buildChain(&agent, outEdges, agentByID, events, now)
+		chain := buildChain(&agent, outEdges, agentByID, events, confirmedHumanPrincipals, now)
 		if len(chain.Hops) > 0 {
 			chains = append(chains, chain)
 		}
@@ -65,6 +74,7 @@ func buildChain(
 	outEdges map[string][]types.AgentEdgeRecord,
 	agentByID map[string]*types.CanonicalAgentRecord,
 	events []types.NormalizedEvent,
+	confirmedHumanPrincipals map[string]bool,
 	now time.Time,
 ) types.DelegationChainRecord {
 	chainID := uuid.New().String()
@@ -75,24 +85,6 @@ func buildChain(
 		RootPrincipalType: string(root.FunctionalClass),
 		RootIntent:        "unknown",
 		ReconstructedAt:   now,
-	}
-
-	// Check if unattended (scheduler-triggered). Primary signal: direct
-	// enumeration (e.g. an EventBridge rule whose target is this root
-	// agent) has already authoritatively confirmed a human-approval-free
-	// trigger — see CanonicalAgentRecord.UnattendedTriggerConfirmed. Only
-	// when that's unset (enumeration found nothing for this agent's
-	// account/region, or wasn't available) do we fall back to inferring
-	// the same fact from a SCHEDULER-attributed CloudTrail event.
-	if root.UnattendedTriggerConfirmed {
-		chain.IsUnattended = true
-	} else {
-		for _, e := range events {
-			if e.Principal.Type == "SCHEDULER" && e.Principal.ID != "" {
-				chain.IsUnattended = true
-				break
-			}
-		}
 	}
 
 	// BFS up to maxHops
@@ -177,5 +169,69 @@ func buildChain(
 		chain.PartialChain = true
 	}
 
+	// Unattended detection. Primary signal: direct enumeration (e.g. an
+	// EventBridge rule whose target is this root agent) has already
+	// authoritatively confirmed a human-approval-free trigger — see
+	// CanonicalAgentRecord.UnattendedTriggerConfirmed. Otherwise, per spec
+	// §7.1: IsUnattended = !hasHumanPrincipal(chain), computed only over
+	// this chain's own agents (root + hops), not a global scan across
+	// every event in the scan.
+	//
+	// Note the resulting bias, matching spec's own definition: absence of
+	// observed human involvement is treated as unattended, not as
+	// "unknown" — the same conservative-toward-flagging default the old
+	// global SCHEDULER-only check did not have.
+	if root.UnattendedTriggerConfirmed {
+		chain.IsUnattended = true
+	} else {
+		chainAgents := make([]*types.CanonicalAgentRecord, 0, len(chain.Hops)+1)
+		chainAgents = append(chainAgents, root)
+		for _, hop := range chain.Hops {
+			if a, ok := agentByID[hop.AgentStableID]; ok {
+				chainAgents = append(chainAgents, a)
+			}
+		}
+		chain.IsUnattended = !hasHumanPrincipal(chainAgents, events, confirmedHumanPrincipals)
+	}
+
 	return chain
+}
+
+// hasHumanPrincipal reports whether a human principal is present anywhere
+// in this specific chain (root + hops) — chain-scoped, per spec §7.1,
+// rather than the account-wide scan the old SCHEDULER-only check did. For
+// each event whose AssumedRoleARN matches one of the chain's agents' IAM
+// role ARNs (the same AssumedRoleARN-to-agent.IAMRoleARN correlation
+// already used for RFC8693 hop detection above), the principal is checked
+// against confirmedHumanPrincipals first — an authoritative source (IAM
+// Identity Center, for AWS) that overrides the CloudTrail-inferred
+// Principal.Type when it can conclusively confirm a principal is human —
+// falling back to Principal.Type == "HUMAN" (extractPrincipal's own
+// classification) when confirmedHumanPrincipals has no entry for it.
+func hasHumanPrincipal(chainAgents []*types.CanonicalAgentRecord, events []types.NormalizedEvent, confirmedHumanPrincipals map[string]bool) bool {
+	roleARNs := make(map[string]bool, len(chainAgents))
+	for _, a := range chainAgents {
+		if a != nil && a.IAMRoleARN != "" {
+			roleARNs[a.IAMRoleARN] = true
+		}
+	}
+	if len(roleARNs) == 0 {
+		return false
+	}
+
+	for _, e := range events {
+		if e.AssumedRoleARN == "" || !roleARNs[e.AssumedRoleARN] {
+			continue
+		}
+		if isHuman, resolved := confirmedHumanPrincipals[e.Principal.ID]; resolved {
+			if isHuman {
+				return true
+			}
+			continue
+		}
+		if e.Principal.Type == "HUMAN" {
+			return true
+		}
+	}
+	return false
 }

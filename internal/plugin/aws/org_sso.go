@@ -57,7 +57,11 @@ func isAWSManagedOrgAccessRole(roleName string) bool {
 // record is synthesized and returned so the finding has a real,
 // platform-valid AgentStableID to attach to (same precedent as
 // discoverExternalAgents synthesizing EXTERNAL_HTTP records).
-func (p *Plugin) scanOrgAndSSO(ctx context.Context, knownAgents []types.CanonicalAgentRecord) ([]types.CanonicalAgentRecord, []types.FindingRecord, error) {
+//
+// events is also cross-referenced against Identity Center (see
+// resolveHumanPrincipals) to produce an authoritative human-principal
+// signal for chain.Reconstruct, feeding chain.hasHumanPrincipal.
+func (p *Plugin) scanOrgAndSSO(ctx context.Context, knownAgents []types.CanonicalAgentRecord, events []types.NormalizedEvent) ([]types.CanonicalAgentRecord, []types.FindingRecord, map[string]bool, error) {
 	var newAgents []types.CanonicalAgentRecord
 	var findings []types.FindingRecord
 
@@ -82,7 +86,9 @@ func (p *Plugin) scanOrgAndSSO(ctx context.Context, knownAgents []types.Canonica
 		findings = append(findings, ssoFindings...)
 	}
 
-	return newAgents, findings, nil
+	confirmedHumanPrincipals := p.resolveHumanPrincipals(ctx, orgAccountIDs, events)
+
+	return newAgents, findings, confirmedHumanPrincipals, nil
 }
 
 // listOrgAccountIDs calls Organizations.ListAccounts using the base
@@ -493,4 +499,116 @@ func permissionSetHasAnyAssignment(ctx context.Context, client *ssoadmin.Client,
 // "this permission set has a real assignment in this account".
 func isAssigned(assignments []ssoadmintypes.AccountAssignment) bool {
 	return len(assignments) > 0
+}
+
+// resolveHumanPrincipals cross-references SSO-shaped AssumedRole principal
+// ARNs actually observed in events against live IAM Identity Center data,
+// producing an authoritative human confirmation for each one Identity
+// Center can verify — used by chain.hasHumanPrincipal to override
+// extractPrincipal's CloudTrail-inferred (ARN-pattern-based) HUMAN
+// classification when it can be corroborated by real, currently-live
+// permission-set provisioning. Reuses findSSOInstanceARN and
+// permissionSetHasAnyAssignment from scanOrphanedPermissionSets rather
+// than re-implementing the same pagination.
+//
+// Deliberately upgrade-only: the returned map only ever contains true
+// entries. It does not attempt to assert a principal is NOT human from
+// Identity Center data — a permission set that's since been unassigned or
+// deleted doesn't mean a past CloudTrail event's principal wasn't a real
+// person, and misclassifying a genuine human session as non-human is a
+// worse failure mode than simply leaving it unresolved (falling back to
+// extractPrincipal's own classification, which already recognizes the
+// AWSReservedSSO_ ARN shape as HUMAN on its own).
+//
+// Returns nil when Identity Center enumeration isn't reachable at all
+// (e.g. scanning a member account directly rather than through the
+// platform's management-account identity) — callers must treat a nil or
+// unresolved-for-this-principal result as "fall back to CloudTrail
+// inference", never as "confirmed not human".
+func (p *Plugin) resolveHumanPrincipals(ctx context.Context, orgAccountIDs []string, events []types.NormalizedEvent) map[string]bool {
+	candidatesByPermissionSetName := map[string][]string{}
+	for _, e := range events {
+		name, ok := ssoPermissionSetNameFromARN(e.Principal.ID)
+		if !ok {
+			continue
+		}
+		candidatesByPermissionSetName[name] = append(candidatesByPermissionSetName[name], e.Principal.ID)
+	}
+	if len(candidatesByPermissionSetName) == 0 {
+		return nil
+	}
+
+	client := ssoadmin.NewFromConfig(p.baseAWSConf)
+
+	instanceArn, err := findSSOInstanceARN(ctx, client)
+	if err != nil || instanceArn == "" {
+		return nil
+	}
+
+	confirmed := map[string]bool{}
+	var nextToken *string
+	for {
+		listOut, err := client.ListPermissionSets(ctx, &ssoadmin.ListPermissionSetsInput{
+			InstanceArn: aws.String(instanceArn),
+			NextToken:   nextToken,
+		})
+		if err != nil {
+			log.Printf("aws: resolveHumanPrincipals ListPermissionSets: %v", err)
+			return confirmed
+		}
+
+		for _, psArn := range listOut.PermissionSets {
+			descOut, err := client.DescribePermissionSet(ctx, &ssoadmin.DescribePermissionSetInput{
+				InstanceArn:      aws.String(instanceArn),
+				PermissionSetArn: aws.String(psArn),
+			})
+			if err != nil || descOut.PermissionSet == nil {
+				continue
+			}
+			name := aws.ToString(descOut.PermissionSet.Name)
+			principalARNs, ok := candidatesByPermissionSetName[name]
+			if !ok {
+				continue
+			}
+			if !permissionSetHasAnyAssignment(ctx, client, instanceArn, psArn, orgAccountIDs) {
+				continue
+			}
+			for _, arn := range principalARNs {
+				confirmed[arn] = true
+			}
+		}
+
+		if listOut.NextToken == nil {
+			break
+		}
+		nextToken = listOut.NextToken
+	}
+
+	return confirmed
+}
+
+// ssoPermissionSetNameFromARN extracts the permission-set name embedded in
+// an IAM Identity Center-generated assumed-role ARN, e.g.
+// "arn:aws:sts::111111111111:assumed-role/AWSReservedSSO_AdministratorAccess_abc123/jane.doe"
+// -> ("AdministratorAccess", true). Returns ok=false for any ARN that
+// doesn't carry the AWSReservedSSO_ prefix at all.
+func ssoPermissionSetNameFromARN(principalARN string) (string, bool) {
+	idx := strings.Index(principalARN, awsReservedSSORolePrefix)
+	if idx == -1 {
+		return "", false
+	}
+	rest := principalARN[idx+len(awsReservedSSORolePrefix):] // "AdministratorAccess_abc123/jane.doe"
+	roleName := rest
+	if slash := strings.Index(rest, "/"); slash != -1 {
+		roleName = rest[:slash] // "AdministratorAccess_abc123"
+	}
+	lastUnderscore := strings.LastIndex(roleName, "_")
+	if lastUnderscore == -1 {
+		return "", false
+	}
+	name := roleName[:lastUnderscore] // "AdministratorAccess"
+	if name == "" {
+		return "", false
+	}
+	return name, true
 }
