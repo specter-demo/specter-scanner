@@ -206,6 +206,7 @@ func (p *Plugin) scanCrossAccountTrustPolicies(ctx context.Context, orgAccountID
 							ExternalID:       roleArn,
 							StableID:         sid,
 							OrgID:            p.cfg.OrgID,
+							AccountID:        selfAccountID,
 							Region:           p.awsCfg.Region,
 							LastSeenAt:       now,
 							IAMRoleARN:       roleArn,
@@ -420,8 +421,13 @@ func (p *Plugin) scanOrphanedPermissionSets(ctx context.Context, orgAccountIDs [
 				agentStableID = sid
 				agentName = name
 				newAgents = append(newAgents, types.CanonicalAgentRecord{
-					Name:             name,
-					Platform:         "AWS_IDENTITY_CENTER_PERMISSION_SET",
+					Name:     name,
+					Platform: "AWS_IDENTITY_CENTER_PERMISSION_SET",
+					// AccountID intentionally left unset: a permission set
+					// is an Identity Center instance-scoped resource (its
+					// own ARN carries no account segment) that can be
+					// assigned across multiple accounts — there's no single
+					// correct account to attribute it to.
 					ExternalID:       psArn,
 					StableID:         sid,
 					OrgID:            p.cfg.OrgID,

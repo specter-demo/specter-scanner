@@ -794,10 +794,21 @@ func (p *Plugin) scanBedrock(ctx context.Context) ([]types.CanonicalAgentRecord,
 			}
 
 			agent := types.CanonicalAgentRecord{
-				Name:            name,
-				Platform:        "AWS_BEDROCK",
-				ExternalID:      agentARN,
-				StableID:        stableID(p.cfg.OrgID, agentARN),
+				Name:       name,
+				Platform:   "AWS_BEDROCK",
+				ExternalID: agentARN,
+				StableID:   stableID(p.cfg.OrgID, agentARN),
+				// AccountID uses the real numeric account ID (see
+				// realAccountID above), unlike ExternalID/StableID which
+				// deliberately use OrgID as a placeholder for backward
+				// compatibility. Known, not-fixed-here limitation: since
+				// ExternalID/StableID don't vary by account, two Bedrock
+				// agents with the same underlying agentID in different
+				// member accounts would collide onto the same StableID —
+				// low real-world probability (Bedrock agent IDs are
+				// random), but a real latent gap multi-account scanning
+				// newly exposes. AccountID itself is correct regardless.
+				AccountID:       realAccountID,
 				AgentClassTag:   tags["specter:agent-class"],
 				OwnerTag:        tags["specter:owner"],
 				IntentStatement: intentTag,
