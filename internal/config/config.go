@@ -37,7 +37,7 @@ type ExternalAgent struct {
 // PlatformConfig is the response from GET /api/v1/scanner/config.
 type PlatformConfig struct {
 	OrgID               string              `json:"orgId"`
-	SigningKey           string              `json:"signingKey"`
+	SigningKey          string              `json:"signingKey"`
 	ScanIntervalMinutes int                 `json:"scanIntervalMinutes"`
 	Plugins             []PluginConfig      `json:"plugins"`
 	SuppressedFindings  []SuppressedFinding `json:"suppressedFindings"`
@@ -174,6 +174,14 @@ type ScannerConfig struct {
 	AWSAccounts []string // from specter.yaml plugins.aws.accounts; no CLI flag equivalent
 	AWSRoleARN  string   // from specter.yaml plugins.aws.role_arn; no CLI flag equivalent
 
+	// AWSOrgMode enables Organizations-based multi-account discovery
+	// (enumerate every member account via ListAccounts, scan each one by
+	// assuming AWSOrgRoleName in it) instead of the regular single-account
+	// Scan(). Distinct from AWSAccounts/AWSRoleARN above, which is a
+	// manually-curated account list — AWSOrgMode auto-discovers accounts.
+	AWSOrgMode     bool
+	AWSOrgRoleName string
+
 	// GitHub (standalone mode)
 	GitHubOrg   string
 	GitHubToken string
@@ -274,6 +282,8 @@ func Parse() *ScannerConfig {
 	flag.StringVar(&cfg.LogLevel, "log-level", "info", "debug|info|warn|error")
 	flag.StringVar(&cfg.OrgSlug, "org-slug", "", "Org slug for cross-org A2A checks (required for cross-org edge detection)")
 	flag.StringVar(&cfg.AWSRegion, "aws-region", "us-east-1", "AWS region to scan (standalone mode)")
+	flag.BoolVar(&cfg.AWSOrgMode, "aws-org-mode", os.Getenv("SPECTER_AWS_ORG_MODE") == "true", "Enumerate every AWS Organizations member account and scan each one, instead of a single account")
+	flag.StringVar(&cfg.AWSOrgRoleName, "aws-org-role-name", awsOrgRoleName(), "Read-only role name assumed in each member account when --aws-org-mode is set")
 	flag.StringVar(&cfg.GitHubOrg, "github-org", "", "GitHub org to scan (required for GitHub plugin)")
 
 	flag.Parse()
@@ -367,4 +377,11 @@ func platformURL() string {
 		return v
 	}
 	return "https://app.spectersystems.ai"
+}
+
+func awsOrgRoleName() string {
+	if v := os.Getenv("SPECTER_AWS_ORG_ROLE_NAME"); v != "" {
+		return v
+	}
+	return "SpecterReadOnly"
 }

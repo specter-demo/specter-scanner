@@ -72,6 +72,33 @@ type ScanResult struct {
 	ConfirmedHumanPrincipals map[string]bool
 }
 
+// AccountScanResult reports one member account's outcome within a
+// multi-account OrganizationScanner run — whether that account's scan
+// succeeded, and why it didn't if not. One entry per account attempted,
+// success or failure, so a caller can tell "this account was scanned and
+// found clean" apart from "this account was never reached".
+type AccountScanResult struct {
+	AccountID string
+	Status    string // "SUCCESS" | "FAILED"
+	Error     string // non-empty when Status == "FAILED"
+}
+
+// OrganizationScanner is an optional capability a ScanPlugin may implement
+// for multi-account discovery: enumerate every member account under an AWS
+// Organization (or equivalent) and run the plugin's existing, unmodified
+// Scan() once per account, aggregating results. Plugins that don't
+// implement this are only ever scanned via the regular ScanPlugin.Scan
+// method, single-account.
+type OrganizationScanner interface {
+	// ScanOrganization enumerates member accounts and scans each one,
+	// continuing past an individual account's failure rather than
+	// aborting the whole run. roleNameTemplate is the read-only role name
+	// to assume in each member account (not a full ARN — the account ID
+	// varies per iteration); implementations default it themselves when
+	// empty.
+	ScanOrganization(ctx context.Context, roleNameTemplate string) (*ScanResult, []AccountScanResult, error)
+}
+
 // ScanPlugin is the interface every plugin must implement.
 // All plugin implementations live in internal/plugin/<name>/.
 type ScanPlugin interface {

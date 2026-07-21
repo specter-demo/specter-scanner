@@ -461,7 +461,27 @@ func runScan(ctx context.Context, cfg *config.ScannerConfig, scanID string, plat
 				defer wg.Done()
 				log.Printf("plugin %s: starting scan", p.Name())
 				start := time.Now()
-				r, err := p.Scan(ctx)
+
+				var r *plugin.ScanResult
+				var err error
+				if cfg.AWSOrgMode {
+					if orgScanner, ok := p.(plugin.OrganizationScanner); ok {
+						var statuses []plugin.AccountScanResult
+						r, statuses, err = orgScanner.ScanOrganization(ctx, cfg.AWSOrgRoleName)
+						for _, s := range statuses {
+							if s.Status == "SUCCESS" {
+								log.Printf("plugin %s: account %s: SUCCESS", p.Name(), s.AccountID)
+							} else {
+								log.Printf("plugin %s: account %s: FAILED: %s", p.Name(), s.AccountID, s.Error)
+							}
+						}
+					} else {
+						r, err = p.Scan(ctx)
+					}
+				} else {
+					r, err = p.Scan(ctx)
+				}
+
 				log.Printf("plugin %s: done in %v", p.Name(), time.Since(start))
 				resultCh <- pluginResult{name: p.Name(), result: r, err: err}
 			}(p)
