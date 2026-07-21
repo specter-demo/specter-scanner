@@ -754,13 +754,37 @@ func deduplicateFindings(findings []types.FindingRecord) []types.FindingRecord {
 	seen := make(map[string]bool)
 	out := make([]types.FindingRecord, 0, len(findings))
 	for _, f := range findings {
-		key := f.AgentStableID + "|" + f.RuleID
+		key := f.AgentStableID + "|" + f.RuleID + findingDedupDiscriminator(f)
 		if !seen[key] {
 			seen[key] = true
 			out = append(out, f)
 		}
 	}
 	return out
+}
+
+// findingDedupDiscriminator returns an extra key component for rules where
+// (AgentStableID, RuleID) alone isn't specific enough — the same rule can
+// legitimately fire more than once for the same agent when each firing
+// references a different target. Returns "" for every other rule, keeping
+// the original (AgentStableID, RuleID) collapse behavior unchanged — most
+// rules only ever fire once per agent, and at least one (
+// MISSING_INTENT_DECLARATION, emitted independently by both the AWS
+// Bedrock intent check and staticref's generic intent check) is
+// intentionally collapsed to one finding despite differently-worded
+// descriptions from each code path; widening the key for every rule would
+// have split that pair back apart.
+func findingDedupDiscriminator(f types.FindingRecord) string {
+	switch f.RuleID {
+	case "AGENT_UNRESOLVED_DEPENDENCY":
+		var evidence struct {
+			TargetExternalID string `json:"targetExternalId"`
+		}
+		if err := json.Unmarshal(f.EvidenceJSON, &evidence); err == nil && evidence.TargetExternalID != "" {
+			return "|" + evidence.TargetExternalID
+		}
+	}
+	return ""
 }
 
 // writeStandaloneReport generates a report file and prints a summary to stdout.
