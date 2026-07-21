@@ -466,3 +466,83 @@ func TestExtractPrincipal_NilIdentity(t *testing.T) {
 		t.Errorf("expected Type=SYSTEM for a nil identity map, got %q", pr.Type)
 	}
 }
+
+// ── extractIAMPermissionRefs ───────────────────────────────────────────────────
+//
+// TestExtractIAMPermissionRefs_STSAssumeRoleProducesSTSAssumeEdge is a
+// regression test for the root cause found investigating why
+// CrossAccountSync-Agent produced zero delegation edges: sts:assumerole
+// was missing from this function's action allowlist entirely, so a real,
+// correctly-provisioned cross-account AssumeRole trust relationship never
+// produced an edge for chain.Reconstruct to build on — regardless of
+// whether it had ever actually been invoked.
+func TestExtractIAMPermissionRefs_STSAssumeRoleProducesSTSAssumeEdge(t *testing.T) {
+	agent := types.CanonicalAgentRecord{
+		ExternalID: "arn:aws:lambda:us-east-1:111111111111:function:example-sync-agent",
+		IAMPermissions: []types.NormalizedPermission{
+			{RawAction: "sts:AssumeRole", ResourceScope: "arn:aws:iam::222222222222:role/example-target-role"},
+		},
+	}
+
+	refs := extractIAMPermissionRefs(agent)
+	if len(refs) != 1 {
+		t.Fatalf("expected 1 ref for a scoped sts:AssumeRole grant, got %d", len(refs))
+	}
+	if refs[0].EdgeType != types.EdgeTypeSTSAssume {
+		t.Errorf("expected EdgeType=%q for an sts:AssumeRole grant, got %q", types.EdgeTypeSTSAssume, refs[0].EdgeType)
+	}
+	if refs[0].TargetExternalID != "arn:aws:iam::222222222222:role/example-target-role" {
+		t.Errorf("expected TargetExternalID to be the assumed role's ARN, got %q", refs[0].TargetExternalID)
+	}
+}
+
+func TestExtractIAMPermissionRefs_STSAssumeRoleWildcardSkipped(t *testing.T) {
+	agent := types.CanonicalAgentRecord{
+		ExternalID: "arn:aws:lambda:us-east-1:111111111111:function:example-sync-agent",
+		IAMPermissions: []types.NormalizedPermission{
+			{RawAction: "sts:AssumeRole", ResourceScope: "*"},
+		},
+	}
+	refs := extractIAMPermissionRefs(agent)
+	if len(refs) != 0 {
+		t.Errorf("expected no ref for a wildcard-scoped sts:AssumeRole grant, got %d", len(refs))
+	}
+}
+
+// TestExtractIAMPermissionRefs_ExistingActionsStillProduceIAMPermissionEdge
+// is the regression test the shared-allowlist change specifically calls
+// for: the 4 pre-existing actions must keep producing EdgeTypeIAMPermission
+// exactly as before, not get swept into EdgeTypeSTSAssume or dropped.
+func TestExtractIAMPermissionRefs_ExistingActionsStillProduceIAMPermissionEdge(t *testing.T) {
+	cases := []string{"lambda:InvokeFunction", "execute-api:Invoke", "bedrock:InvokeAgent", "bedrock:InvokeModel"}
+	for _, action := range cases {
+		t.Run(action, func(t *testing.T) {
+			agent := types.CanonicalAgentRecord{
+				ExternalID: "arn:aws:lambda:us-east-1:111111111111:function:example-caller-agent",
+				IAMPermissions: []types.NormalizedPermission{
+					{RawAction: action, ResourceScope: "arn:aws:lambda:us-east-1:111111111111:function:example-callee-agent"},
+				},
+			}
+			refs := extractIAMPermissionRefs(agent)
+			if len(refs) != 1 {
+				t.Fatalf("expected 1 ref for %s, got %d", action, len(refs))
+			}
+			if refs[0].EdgeType != types.EdgeTypeIAMPermission {
+				t.Errorf("expected %s to still produce EdgeType=%q, got %q", action, types.EdgeTypeIAMPermission, refs[0].EdgeType)
+			}
+		})
+	}
+}
+
+func TestExtractIAMPermissionRefs_UnrelatedActionIgnored(t *testing.T) {
+	agent := types.CanonicalAgentRecord{
+		ExternalID: "arn:aws:lambda:us-east-1:111111111111:function:example-agent",
+		IAMPermissions: []types.NormalizedPermission{
+			{RawAction: "s3:GetObject", ResourceScope: "arn:aws:s3:::example-bucket/*"},
+		},
+	}
+	refs := extractIAMPermissionRefs(agent)
+	if len(refs) != 0 {
+		t.Errorf("expected no ref for an action outside the allowlist, got %d", len(refs))
+	}
+}

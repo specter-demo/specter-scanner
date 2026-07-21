@@ -1427,12 +1427,23 @@ func extractEnvVarReferences(agent types.CanonicalAgentRecord, envVars map[strin
 // extractIAMPermissionRefs examines the agent's already-populated IAMPermissions
 // for actions that invoke other agents on specific (non-wildcard) resources.
 // Confidence is fixed at 0.90 per spec section 4.4.
+//
+// Each action maps to the edge type its grant should produce.
+// sts:assumerole produces EdgeTypeSTSAssume specifically, not the generic
+// EdgeTypeIAMPermission the other actions produce — chain.Reconstruct keys
+// its RFC 8693 compliance check on that exact edge type (see chain.go),
+// and until this action was added here, no code path in the scanner ever
+// produced an EdgeTypeSTSAssume edge at all: a real, provisioned
+// cross-account (or same-account) AssumeRole trust relationship was
+// invisible to chain reconstruction regardless of whether it had ever
+// actually been exercised.
 func extractIAMPermissionRefs(agent types.CanonicalAgentRecord) []types.StaticRef {
-	agentInvokeActions := map[string]bool{
-		"lambda:invokefunction": true,
-		"execute-api:invoke":    true,
-		"bedrock:invokeagent":   true,
-		"bedrock:invokemodel":   true,
+	agentInvokeActions := map[string]types.EdgeType{
+		"lambda:invokefunction": types.EdgeTypeIAMPermission,
+		"execute-api:invoke":    types.EdgeTypeIAMPermission,
+		"bedrock:invokeagent":   types.EdgeTypeIAMPermission,
+		"bedrock:invokemodel":   types.EdgeTypeIAMPermission,
+		"sts:assumerole":        types.EdgeTypeSTSAssume,
 	}
 
 	var refs []types.StaticRef
@@ -1442,7 +1453,8 @@ func extractIAMPermissionRefs(agent types.CanonicalAgentRecord) []types.StaticRe
 			continue // skip wildcards per spec
 		}
 		action := strings.ToLower(perm.RawAction)
-		if !agentInvokeActions[action] {
+		edgeType, ok := agentInvokeActions[action]
+		if !ok {
 			continue
 		}
 		if seen[perm.ResourceScope] {
@@ -1453,7 +1465,7 @@ func extractIAMPermissionRefs(agent types.CanonicalAgentRecord) []types.StaticRe
 			SourceAgentExternalID: agent.ExternalID,
 			TargetExternalID:      perm.ResourceScope,
 			RefSource:             "IAM_POLICY",
-			EdgeType:              types.EdgeTypeIAMPermission,
+			EdgeType:              edgeType,
 			Confidence:            0.90,
 			Evidence:              fmt.Sprintf("IAM policy allows %s on %s", perm.RawAction, perm.ResourceScope),
 		})
