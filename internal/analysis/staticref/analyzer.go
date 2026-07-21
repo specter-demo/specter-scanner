@@ -44,6 +44,7 @@ func (a *Analyzer) Analyze(
 	// Build lookup indexes
 	byExternalID := map[string]*types.CanonicalAgentRecord{}
 	byPublicURL := map[string]*types.CanonicalAgentRecord{}
+	byIAMRoleARN := map[string]*types.CanonicalAgentRecord{}
 	for i := range agents {
 		ag := &agents[i]
 		if ag.ExternalID != "" {
@@ -57,6 +58,9 @@ func (a *Analyzer) Analyze(
 		}
 		if ag.APIGatewayURL != "" {
 			byPublicURL[normalizeURL(ag.APIGatewayURL)] = ag
+		}
+		if ag.IAMRoleARN != "" {
+			byIAMRoleARN[ag.IAMRoleARN] = ag
 		}
 	}
 
@@ -76,8 +80,8 @@ func (a *Analyzer) Analyze(
 			continue // source agent not in registry — skip
 		}
 
-		// Try to find target agent by externalId or URL
-		targetAgent := resolveTarget(ref.TargetExternalID, byExternalID, byPublicURL)
+		// Try to find target agent by externalId, URL, or IAM role ARN
+		targetAgent := resolveTarget(ref.TargetExternalID, byExternalID, byPublicURL, byIAMRoleARN)
 
 		if targetAgent != nil {
 			// Resolved — create an edge if not already present
@@ -131,15 +135,25 @@ func (a *Analyzer) Analyze(
 }
 
 // resolveTarget tries to match a target identifier against the known agent set.
-// It checks: exact externalId match, prefix match for ARN-style resources,
-// and URL match for HTTP endpoints.
+// It checks: exact externalId match, exact IAM role ARN match, prefix match
+// for ARN-style resources, and URL match for HTTP endpoints.
 func resolveTarget(
 	targetID string,
 	byExternalID map[string]*types.CanonicalAgentRecord,
 	byPublicURL map[string]*types.CanonicalAgentRecord,
+	byIAMRoleARN map[string]*types.CanonicalAgentRecord,
 ) *types.CanonicalAgentRecord {
 	// Exact match
 	if ag, ok := byExternalID[targetID]; ok {
+		return ag
+	}
+
+	// Exact IAM role ARN match — an sts:AssumeRole ref's target is always a
+	// role ARN, which is never an agent's own ExternalID (that's always the
+	// function/service ARN). Exact only, no fuzzy prefix matching: two
+	// unrelated roles can share a naming prefix, and a role assumption is a
+	// precise, security-relevant relationship not worth guessing at.
+	if ag, ok := byIAMRoleARN[targetID]; ok {
 		return ag
 	}
 
