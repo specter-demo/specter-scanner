@@ -1,4 +1,4 @@
 dist/
 *.log
 *.tmp
-scanner
+/scanner
