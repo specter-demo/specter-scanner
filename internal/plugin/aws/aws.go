@@ -1054,8 +1054,8 @@ func (p *Plugin) FetchEvents(ctx context.Context, since time.Time) ([]types.Norm
 	var nextToken *string
 	pages := 0
 
-	// Only fetch AssumeRole and InvokeFunction events for behavioral analysis
-	// This dramatically reduces the result set for busy accounts
+	// Only fetch AssumeRole events for behavioral analysis. This dramatically
+	// reduces the result set for busy accounts.
 	for _, eventName := range []string{"AssumeRole"} {
 		nextToken = nil
 		pages = 0
