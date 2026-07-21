@@ -29,9 +29,9 @@ import (
 
 	gogithub "github.com/google/go-github/v66/github"
 	"golang.org/x/oauth2"
-	"gopkg.in/yaml.v3"
 
 	"github.com/specter-demo/specter-scanner/internal/plugin"
+	"github.com/specter-demo/specter-scanner/internal/plugin/shared"
 	"github.com/specter-demo/specter-scanner/internal/types"
 )
 
@@ -290,7 +290,7 @@ type GitHubRepoContent struct {
 	MCPJson         string
 	CrewDir         bool
 	ImportSignals   []string
-	SecretFindings  []secretFinding
+	SecretFindings  []shared.SecretMatch
 	WorkflowFiles   []workflowFile
 
 	// Phase 11.5: intent declaration
@@ -308,24 +308,12 @@ type GitHubRepoContent struct {
 	SourceRefs []types.StaticRef
 }
 
-type secretFinding struct {
-	Path    string
-	Pattern string
-	Match   string
-}
-
 type workflowFile struct {
 	Name    string
 	Content string
 }
 
 var (
-	secretPatterns = []*regexp.Regexp{
-		regexp.MustCompile(`sk-svcacct-[A-Za-z0-9_-]{20,}`),
-		regexp.MustCompile(`sk-ant-api0[3-9]-[A-Za-z0-9_-]{20,}`),
-		regexp.MustCompile(`AKIA[0-9A-Z]{16}`),
-	}
-
 	// Package manifest patterns (Signal Layer 1)
 	manifestFrameworks = []struct {
 		pattern    *regexp.Regexp
@@ -516,35 +504,14 @@ func (p *Plugin) scanWorkflows(ctx context.Context, client *gogithub.Client, org
 func (p *Plugin) scanSecretsInFiles(ctx context.Context, client *gogithub.Client, org, repo string, content *GitHubRepoContent) {
 	var envContent string
 	p.fetchFileContent(ctx, client, org, repo, ".env", &envContent)
-	if envContent != "" {
-		for _, pat := range secretPatterns {
-			if m := pat.FindString(envContent); m != "" {
-				content.SecretFindings = append(content.SecretFindings, secretFinding{
-					Path:    ".env",
-					Pattern: truncate(pat.String(), 20),
-					Match:   truncate(m, 20),
-				})
-			}
-		}
-	}
+	content.SecretFindings = append(content.SecretFindings, shared.ScanContentForSecrets(".env", envContent)...)
 
 	// Also check requirements.txt for accidentally committed secrets
 	for _, item := range []struct{ path, text string }{
 		{path: "requirements.txt", text: content.RequirementsTxt},
 		{path: "pyproject.toml", text: content.PyprojectToml},
 	} {
-		if item.text == "" {
-			continue
-		}
-		for _, pat := range secretPatterns {
-			if m := pat.FindString(item.text); m != "" {
-				content.SecretFindings = append(content.SecretFindings, secretFinding{
-					Path:    item.path,
-					Pattern: truncate(pat.String(), 20),
-					Match:   truncate(m, 20),
-				})
-			}
-		}
+		content.SecretFindings = append(content.SecretFindings, shared.ScanContentForSecrets(item.path, item.text)...)
 	}
 }
 
@@ -614,62 +581,29 @@ const (
 	IntentSourceReadme   = "README"
 )
 
-// specterManifest is a partial parse of .specter/manifest.yaml.
-// Supports the nested specter.agent.* schema.
-type specterManifest struct {
-	Specter struct {
-		Agent struct {
-			Intent       string                 `yaml:"intent"`
-			Owner        string                 `yaml:"owner"`
-			Capabilities []string               `yaml:"capabilities"`
-			// RiskAcknowledgements is a free-form map (handles_pii: true, etc.);
-			// declared as map[string]interface{} to tolerate any value type.
-			RiskAcknowledgements map[string]interface{} `yaml:"risk_acknowledgements"`
-			Deployment struct {
-				Target      string `yaml:"target"`
-				Status      string `yaml:"status"`
-				Region      string `yaml:"region"`
-				Environment string `yaml:"environment"`
-			} `yaml:"deployment"`
-		} `yaml:"agent"`
-	} `yaml:"specter"`
-	// Legacy flat fields for backward compatibility
-	Name        string `yaml:"name"`
-	Description string `yaml:"description"`
-	Owner       string `yaml:"owner"`
-}
-
 // extractIntentDeclaration looks for intent files in priority order:
 // .specter/manifest.yaml → AGENT.md → CLAUDE.md → README.md
 func (p *Plugin) extractIntentDeclaration(ctx context.Context, client *gogithub.Client, org, repo string, content *GitHubRepoContent) {
-	// Priority 1: .specter/manifest.yaml — nested specter.agent.intent schema
+	// Priority 1: .specter/manifest.yaml — nested specter.agent.intent schema.
+	// Parsing lives in internal/plugin/shared so the AWS plugin's CodeCommit
+	// discovery parses the exact same manifest format identically.
 	var manifestTxt string
 	p.fetchFileContent(ctx, client, org, repo, ".specter/manifest.yaml", &manifestTxt)
 	if manifestTxt != "" {
-		var m specterManifest
-		if err := yaml.Unmarshal([]byte(manifestTxt), &m); err == nil {
-			intent := m.Specter.Agent.Intent
-			owner := m.Specter.Agent.Owner
-			// Fall back to legacy flat fields
-			if intent == "" {
-				intent = m.Description
-			}
-			if owner == "" {
-				owner = m.Owner
-			}
-			if intent != "" {
-				content.IntentText = truncate(intent, 500)
+		if m, ok := shared.ParseSpecterManifest(manifestTxt); ok {
+			if m.Intent != "" {
+				content.IntentText = truncate(m.Intent, 500)
 				content.IntentSource = IntentSourceManifest
-				content.IntentOwner = owner
+				content.IntentOwner = m.Owner
 			}
 			// Capture deployment declaration regardless of whether intent was found.
 			// A deployment.target is a formal governance statement even when
 			// status is "pending" and even when the manifest has no intent field.
-			if m.Specter.Agent.Deployment.Target != "" {
-				content.ManifestDeploymentTarget = m.Specter.Agent.Deployment.Target
-				content.ManifestDeploymentStatus = m.Specter.Agent.Deployment.Status
+			if m.DeploymentTarget != "" {
+				content.ManifestDeploymentTarget = m.DeploymentTarget
+				content.ManifestDeploymentStatus = m.DeploymentStatus
 			}
-			if intent != "" {
+			if m.Intent != "" {
 				return
 			}
 		}
@@ -798,7 +732,7 @@ func stripMarkdown(line string) string {
 	// Replace [text](url) links with just the text
 	line = regexp.MustCompile(`\[([^\]]+)\]\([^\)]+\)`).ReplaceAllString(line, "$1")
 	// Remove remaining markdown punctuation
-	line = regexp.MustCompile(`[*_` + "`" + `]`).ReplaceAllString(line, "")
+	line = regexp.MustCompile(`[*_`+"`"+`]`).ReplaceAllString(line, "")
 	return strings.TrimSpace(line)
 }
 
@@ -991,11 +925,11 @@ func containsAny(s string, substrs ...string) bool {
 // ── Phase 11.5: source code reference extraction ────────────────────────────
 
 var (
-	srcLambdaARN    = regexp.MustCompile(`arn:aws:lambda:[a-z0-9-]+:\d{12}:function:[a-zA-Z0-9_:-]+`)
-	srcAPIGWARN     = regexp.MustCompile(`arn:aws:execute-api:[a-z0-9-]+:\d{12}:[a-zA-Z0-9]+`)
-	srcAPIGWURL     = regexp.MustCompile(`https://[a-z0-9]+\.execute-api\.[a-z0-9-]+\.amazonaws\.com(?:/[^\s"']*)?`)
-	srcBedrockARN   = regexp.MustCompile(`arn:aws:bedrock:[a-z0-9-]+:\d{12}:(?:agent|foundation-model|agent-alias)/[a-zA-Z0-9/_.-]+`)
-	srcFunctionURL  = regexp.MustCompile(`https://[a-z0-9]+\.lambda-url\.[a-z0-9-]+\.on\.aws(?:/[^\s"']*)?`)
+	srcLambdaARN   = regexp.MustCompile(`arn:aws:lambda:[a-z0-9-]+:\d{12}:function:[a-zA-Z0-9_:-]+`)
+	srcAPIGWARN    = regexp.MustCompile(`arn:aws:execute-api:[a-z0-9-]+:\d{12}:[a-zA-Z0-9]+`)
+	srcAPIGWURL    = regexp.MustCompile(`https://[a-z0-9]+\.execute-api\.[a-z0-9-]+\.amazonaws\.com(?:/[^\s"']*)?`)
+	srcBedrockARN  = regexp.MustCompile(`arn:aws:bedrock:[a-z0-9-]+:\d{12}:(?:agent|foundation-model|agent-alias)/[a-zA-Z0-9/_.-]+`)
+	srcFunctionURL = regexp.MustCompile(`https://[a-z0-9]+\.lambda-url\.[a-z0-9-]+\.on\.aws(?:/[^\s"']*)?`)
 )
 
 // isTestOrVendorPath returns true if the path looks like a test or vendored file.

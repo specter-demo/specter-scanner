@@ -19,7 +19,7 @@ import (
 // since we can't easily mock the AWS SDK without interfaces.
 func TestDiscoversLambdaAgents(t *testing.T) {
 	p := &Plugin{
-		cfg: plugin.PluginConfig{OrgID: "test-org"},
+		cfg:    plugin.PluginConfig{OrgID: "test-org"},
 		awsCfg: AWSPluginConfig{Region: "us-east-1"},
 	}
 
@@ -53,7 +53,7 @@ func TestDiscoversLambdaAgents(t *testing.T) {
 
 func TestFrameworkDetectionFromTags(t *testing.T) {
 	p := &Plugin{
-		cfg: plugin.PluginConfig{OrgID: "test-org"},
+		cfg:    plugin.PluginConfig{OrgID: "test-org"},
 		awsCfg: AWSPluginConfig{Region: "us-east-1"},
 	}
 
@@ -334,5 +334,60 @@ func TestDetectBursts(t *testing.T) {
 	bursts := detectBursts(events, 3, 60*time.Second)
 	if len(bursts) == 0 {
 		t.Error("expected to detect at least one burst")
+	}
+}
+
+// ── SECRETSMANAGER_WILDCARD_ACCESS ────────────────────────────────────────────
+
+func TestAppendSecretsManagerWildcardFinding_WildcardResource(t *testing.T) {
+	agent := types.CanonicalAgentRecord{
+		StableID:   "example-agent-id",
+		Name:       "example-agent",
+		IAMRoleARN: "arn:aws:iam::111111111111:role/example-agent-role",
+	}
+	perms := []types.NormalizedPermission{
+		{RawAction: "secretsmanager:GetSecretValue", ResourceScope: "*"},
+	}
+
+	var findings []types.FindingRecord
+	appendSecretsManagerWildcardFinding(&findings, agent, perms, "example-agent-role-policy", time.Now())
+
+	if len(findings) != 1 {
+		t.Fatalf("expected 1 finding for a wildcard-scoped secretsmanager:GetSecretValue grant, got %d", len(findings))
+	}
+	if findings[0].RuleID != "SECRETSMANAGER_WILDCARD_ACCESS" {
+		t.Errorf("expected RuleID SECRETSMANAGER_WILDCARD_ACCESS, got %q", findings[0].RuleID)
+	}
+}
+
+func TestAppendSecretsManagerWildcardFinding_ScopedResource_NoFinding(t *testing.T) {
+	agent := types.CanonicalAgentRecord{
+		StableID:   "example-agent-id",
+		Name:       "example-agent",
+		IAMRoleARN: "arn:aws:iam::111111111111:role/example-agent-role",
+	}
+	perms := []types.NormalizedPermission{
+		{RawAction: "secretsmanager:GetSecretValue", ResourceScope: "arn:aws:secretsmanager:us-east-1:111111111111:secret:example-secret-abc123"},
+	}
+
+	var findings []types.FindingRecord
+	appendSecretsManagerWildcardFinding(&findings, agent, perms, "example-agent-role-policy", time.Now())
+
+	if len(findings) != 0 {
+		t.Errorf("expected no finding for a secretsmanager:GetSecretValue grant scoped to a specific secret ARN, got %d", len(findings))
+	}
+}
+
+func TestAppendSecretsManagerWildcardFinding_NoMatchingAction(t *testing.T) {
+	agent := types.CanonicalAgentRecord{StableID: "example-agent-id", Name: "example-agent"}
+	perms := []types.NormalizedPermission{
+		{RawAction: "s3:GetObject", ResourceScope: "*"},
+	}
+
+	var findings []types.FindingRecord
+	appendSecretsManagerWildcardFinding(&findings, agent, perms, "example-agent-role-policy", time.Now())
+
+	if len(findings) != 0 {
+		t.Errorf("expected no finding when no permission is a secretsmanager:GetSecretValue grant, got %d", len(findings))
 	}
 }

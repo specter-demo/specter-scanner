@@ -193,9 +193,9 @@ func intentFindings(ag *types.CanonicalAgentRecord, now time.Time) []types.Findi
 
 	if !isFormalIntent {
 		evidence, _ := json.Marshal(map[string]string{
-			"agentName":     ag.Name,
-			"platform":      ag.Platform,
-			"intentSource":  ag.IntentSource,
+			"agentName":       ag.Name,
+			"platform":        ag.Platform,
+			"intentSource":    ag.IntentSource,
 			"visibilityClass": string(ag.VisibilityClass),
 		})
 		findings = append(findings, types.FindingRecord{
@@ -288,6 +288,14 @@ func isAIAgent(ag *types.CanonicalAgentRecord) bool {
 	}
 	if ag.Platform == "GITHUB" {
 		return true // GitHub plugin only emits agents if they look like AI repos
+	}
+	if ag.RepoName != "" {
+		// A source repo was correlated to this agent (e.g. the AWS plugin's
+		// CodeCommit discovery matching a repo to a Lambda/ECS/Bedrock
+		// agent) — same reasoning as the GITHUB case: a plugin only
+		// populates RepoName when it found a real, specific source-control
+		// association worth intent-checking, not for every resource it sees.
+		return true
 	}
 	// Managed AI platforms are always AI agents by definition
 	switch ag.Platform {

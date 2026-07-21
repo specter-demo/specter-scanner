@@ -3,7 +3,7 @@
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 [![Go Version](https://img.shields.io/badge/Go-1.22+-blue.svg)](https://golang.org)
 
-**Specter Scanner** is an open-source CLI tool that discovers, classifies, and audits AI agents running in your infrastructure. It scans AWS (Lambda, ECS, Bedrock), GitHub repositories, and probes A2A and MCP protocol endpoints to produce a complete inventory of every AI agent in your environment — governed, discovered, shadow, and unregistered — along with security findings and a risk assessment for each.
+**Specter Scanner** is an open-source CLI tool that discovers, classifies, and audits AI agents running in your infrastructure. It scans AWS (Lambda, ECS, Bedrock, CodeCommit/CodeBuild/CodePipeline/CodeDeploy/ECR, Organizations, IAM Identity Center), GitHub repositories, and probes A2A and MCP protocol endpoints to produce a complete inventory of every AI agent in your environment — governed, discovered, shadow, and unregistered — along with security findings and a risk assessment for each.
 
 Specter Scanner is the open-core foundation of the [Specter Platform](https://spectersystems.ai), an AI agent identity governance platform. The scanner runs in your own infrastructure. Your agent inventory never leaves your environment unless you explicitly connect it to the platform.
 
@@ -14,8 +14,17 @@ Specter Scanner is the open-core foundation of the [Specter Platform](https://sp
 **AWS agents:**
 - Lambda functions using AI/agent frameworks (LangGraph, CrewAI, OpenAI SDK, Anthropic SDK)
 - ECS services running agent workloads
-- Bedrock managed agents
+- Bedrock managed agents, including whether a Guardrail is attached
 - IAM roles, creators, and permission scope for each agent
+- Cross-account IAM trust policies missing an `sts:ExternalId` condition
+- IAM Identity Center permission sets with zero account assignments (requires running from the AWS Organizations management account)
+
+**AWS CI/CD pipelines:**
+- CodeCommit repositories: declared intent (`.specter/manifest.yaml`, `AGENT.md`, `CLAUDE.md`) and committed secrets, correlated to the agent they build
+- CodeBuild service roles with an overly broad `iam:PassRole` grant
+- ECR repositories with image scanning disabled
+- CodePipeline pipelines with no manual approval gate before deploy
+- CodeDeploy applications and deployment groups, for deployment-target context
 
 **GitHub agents:**
 - Repositories containing agent source code
@@ -42,7 +51,10 @@ The scanner produces findings in these categories:
 | Category | Rule IDs |
 |---|---|
 | NHI (Non-Human Identity) | `NHI_ORPHANED_CREATOR`, `NHI_STALE_ROLE` |
-| IAM | `IAM_NO_OWNER_TAG`, `IAM_WILDCARD_RESOURCE` |
+| IAM | `IAM_NO_OWNER_TAG`, `IAM_WILDCARD_RESOURCE`, `SECRETSMANAGER_WILDCARD_ACCESS` |
+| Bedrock | `BEDROCK_NO_GUARDRAIL` |
+| CI/CD | `CODEBUILD_WILDCARD_SERVICE_ROLE`, `ECR_SCAN_ON_PUSH_DISABLED`, `CODEPIPELINE_NO_APPROVAL_GATE` |
+| Organizations / Identity Center | `ORG_CROSS_ACCOUNT_NO_EXTERNAL_ID`, `SSO_ORPHANED_PERMISSION_SET` |
 | A2A Protocol | `A2A_AUTH_NONE`, `A2A_CARD_SIGNED`, `A2A_CROSS_ORG`, `A2A_WILDCARD_CAPABILITY`, `A2A_CARD_UNREACHABLE` |
 | MCP Protocol | `MCP_OAUTH_DISABLED`, `MCP_NO_PKCE`, `MCP_NO_RESOURCE_INDICATOR`, `MCP_WILDCARD_SCOPE` |
 | GitHub | `GITHUB_COMMITTED_SECRET`, `GITHUB_STATIC_AWS_CREDS`, `GITHUB_UNSCOPED_WORKFLOW` |
@@ -187,13 +199,42 @@ The scanner requires read-only access to your AWS account. Create an IAM role wi
         "iam:GetRolePolicy",
         "iam:ListAttachedRolePolicies",
         "iam:ListRolePolicies",
+        "iam:ListRoles",
         "iam:ListUsers",
         "cloudtrail:LookupEvents",
-        "sts:GetCallerIdentity"
+        "sts:GetCallerIdentity",
+        "codecommit:ListRepositories",
+        "codecommit:GetRepository",
+        "codecommit:GetFile",
+        "codebuild:ListProjects",
+        "codebuild:BatchGetProjects",
+        "ecr:DescribeRepositories",
+        "codepipeline:ListPipelines",
+        "codepipeline:GetPipeline",
+        "codedeploy:ListApplications",
+        "codedeploy:ListDeploymentGroups"
       ],
       "Resource": "*"
     }
   ]
+}
+```
+
+`iam:ListRoles` is new as of the CI/CD and Organizations discovery steps — it's needed to find cross-account IAM roles that aren't attached to any Lambda/ECS/Bedrock agent (e.g. a role that exists purely as a cross-account assume-role target).
+
+**Organizations and IAM Identity Center discovery is optional and management-account-only.** `ORG_CROSS_ACCOUNT_NO_EXTERNAL_ID` and `SSO_ORPHANED_PERMISSION_SET` need these additional permissions, and only produce results when the scanner runs with credentials from your AWS Organizations *management* account — both services are org-wide, not visible from a member account, even via the cross-account role above. Running without them is fully supported: the scanner logs the permission error and skips these two checks, same as any other AWS API call it isn't authorized for.
+
+```json
+{
+  "Effect": "Allow",
+  "Action": [
+    "organizations:ListAccounts",
+    "sso:ListInstances",
+    "sso:ListPermissionSets",
+    "sso:DescribePermissionSet",
+    "sso:ListAccountAssignments"
+  ],
+  "Resource": "*"
 }
 ```
 

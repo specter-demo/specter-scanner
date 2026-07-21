@@ -53,6 +53,15 @@ type Plugin struct {
 	awsCfg  AWSPluginConfig
 	awsConf aws.Config
 	since   time.Duration
+
+	// baseAWSConf holds the pre-assumption identity: in cross-account mode
+	// this is the platform account's own session (before assuming into the
+	// member account being scanned); in standalone mode it's the same as
+	// awsConf. Organizations and IAM Identity Center are management-account-
+	// scoped services — Step 7 (scanOrgAndSSO) uses this instead of awsConf,
+	// since the assumed SpecterReadOnly role in a member account has no
+	// visibility into either.
+	baseAWSConf aws.Config
 }
 
 func init() {
@@ -81,7 +90,11 @@ func (p *Plugin) loadAWSConfig(ctx context.Context) (aws.Config, error) {
 		opts := []func(*awscfg.LoadOptions) error{
 			awscfg.WithRegion(p.awsCfg.Region),
 		}
-		return awscfg.LoadDefaultConfig(ctx, opts...)
+		cfg, err := awscfg.LoadDefaultConfig(ctx, opts...)
+		if err == nil {
+			p.baseAWSConf = cfg
+		}
+		return cfg, err
 	}
 
 	// Cloud-hosted mode: assume SpecterReadOnly cross-account role.
@@ -89,6 +102,7 @@ func (p *Plugin) loadAWSConfig(ctx context.Context) (aws.Config, error) {
 	if err != nil {
 		return aws.Config{}, fmt.Errorf("aws: load base config: %w", err)
 	}
+	p.baseAWSConf = baseCfg
 
 	stsClient := sts.NewFromConfig(baseCfg)
 	creds := stscreds.NewAssumeRoleProvider(stsClient, p.awsCfg.RoleARN,
@@ -220,6 +234,21 @@ func (p *Plugin) Scan(ctx context.Context) (*plugin.ScanResult, error) {
 		log.Printf("aws: cloudtrail fetch error: %v", err)
 	}
 	result.Events = events
+
+	// Step 6: Source/CI-CD (CodeCommit, CodeBuild, CodePipeline, CodeDeploy, ECR)
+	cicdFindings, err := p.scanCICD(ctx, result.Agents)
+	if err != nil {
+		log.Printf("aws: cicd scan error: %v", err)
+	}
+	result.Findings = append(result.Findings, cicdFindings...)
+
+	// Step 7: Organizations + IAM Identity Center
+	orgAgents, orgFindings, err := p.scanOrgAndSSO(ctx, result.Agents)
+	if err != nil {
+		log.Printf("aws: org/sso scan error: %v", err)
+	}
+	result.Agents = append(result.Agents, orgAgents...)
+	result.Findings = append(result.Findings, orgFindings...)
 
 	// Detect behavioral ephemeral spawns
 	// Exclude the scanner's own session ARN to avoid self-detection false positives
@@ -434,11 +463,7 @@ func (p *Plugin) enrichIAMRole(ctx context.Context, agent types.CanonicalAgentRe
 			if err != nil {
 				continue
 			}
-			doc := aws.ToString(policyOut.PolicyDocument)
-			if decoded, err := url.QueryUnescape(doc); err == nil {
-				doc = decoded
-			}
-			perms := parseIAMPolicy(doc)
+			perms := parseIAMPolicy(decodeIAMPolicyDoc(aws.ToString(policyOut.PolicyDocument)))
 			agent.IAMPermissions = append(agent.IAMPermissions, perms...)
 
 			if hasWildcardOnSensitive(perms) && !agent.HasWildcard {
@@ -459,6 +484,8 @@ func (p *Plugin) enrichIAMRole(ctx context.Context, agent types.CanonicalAgentRe
 					Plugin:        "aws",
 				})
 			}
+
+			appendSecretsManagerWildcardFinding(findings, agent, perms, policyName, now)
 		}
 	}
 
@@ -482,11 +509,7 @@ func (p *Plugin) enrichIAMRole(ctx context.Context, agent types.CanonicalAgentRe
 			if err != nil {
 				continue
 			}
-			doc := aws.ToString(versionOut.PolicyVersion.Document)
-			if decoded, err := url.QueryUnescape(doc); err == nil {
-				doc = decoded
-			}
-			perms := parseIAMPolicy(doc)
+			perms := parseIAMPolicy(decodeIAMPolicyDoc(aws.ToString(versionOut.PolicyVersion.Document)))
 			agent.IAMPermissions = append(agent.IAMPermissions, perms...)
 
 			if hasWildcardOnSensitive(perms) && !agent.HasWildcard {
@@ -507,6 +530,8 @@ func (p *Plugin) enrichIAMRole(ctx context.Context, agent types.CanonicalAgentRe
 					Plugin:        "aws",
 				})
 			}
+
+			appendSecretsManagerWildcardFinding(findings, agent, perms, aws.ToString(attached.PolicyArn), now)
 		}
 	}
 
@@ -774,6 +799,29 @@ func (p *Plugin) scanBedrock(ctx context.Context) ([]types.CanonicalAgentRecord,
 			log.Printf("aws: bedrock agent %s — owner=%q intent_tag=%q intent_source=%q",
 				name, agent.OwnerTag, intentTag, intentSource)
 
+			// BEDROCK_NO_GUARDRAIL — additive to this existing Bedrock
+			// discovery loop (Step 3), not a new step: for every agent
+			// already being fetched here, GetAgent also returns
+			// guardrailConfiguration in the same response.
+			getOut, err := client.GetAgent(ctx, &bedrockagent.GetAgentInput{AgentId: aws.String(agentID)})
+			if err == nil && getOut.Agent != nil && getOut.Agent.GuardrailConfiguration == nil {
+				evidence, _ := json.Marshal(map[string]string{
+					"agentId":  agentID,
+					"agentArn": agentARN,
+				})
+				findings = append(findings, types.FindingRecord{
+					RuleID:        "BEDROCK_NO_GUARDRAIL",
+					Severity:      "HIGH",
+					AgentStableID: agent.StableID,
+					AgentName:     agent.Name,
+					Title:         "Bedrock agent has no Guardrail attached",
+					Description:   fmt.Sprintf("Bedrock agent %s has no guardrailConfiguration — no content filtering or PII handling is enforced at the model boundary.", name),
+					EvidenceJSON:  evidence,
+					DiscoveredAt:  now,
+					Plugin:        "aws",
+				})
+			}
+
 			// Missing owner tag → shadow / governance gap
 			if agent.OwnerTag == "" {
 				evidence, _ := json.Marshal(map[string]string{
@@ -805,8 +853,8 @@ func (p *Plugin) scanBedrock(ctx context.Context) ([]types.CanonicalAgentRecord,
 			// mode, so remediation language must make sense whether the report ends up
 			// in the Specter UI or a standalone file.
 			evidence, _ := json.Marshal(map[string]string{
-				"agentId":     agentID,
-				"agentName":  name,
+				"agentId":        agentID,
+				"agentName":      name,
 				"intentTagValue": agent.IntentStatement,
 			})
 			findings = append(findings, types.FindingRecord{
@@ -1316,11 +1364,11 @@ func (p *Plugin) detectFrameworkFromEnv(agent types.CanonicalAgentRecord, envVar
 
 // arnPatterns match common AWS resource identifiers that imply an inter-agent dependency.
 var (
-	lambdaARNPattern    = regexp.MustCompile(`arn:aws:lambda:[a-z0-9-]+:\d{12}:function:[a-zA-Z0-9_:-]+`)
-	apiGWARNPattern     = regexp.MustCompile(`arn:aws:execute-api:[a-z0-9-]+:\d{12}:[a-zA-Z0-9]+`)
-	apiGWURLEnvPattern  = regexp.MustCompile(`https://[a-z0-9]+\.execute-api\.[a-z0-9-]+\.amazonaws\.com(?:/[^\s"']*)?`)
-	bedrockARNPattern   = regexp.MustCompile(`arn:aws:bedrock:[a-z0-9-]+:\d{12}:(?:agent|foundation-model|agent-alias)/[a-zA-Z0-9/_.-]+`)
-	functionURLPattern  = regexp.MustCompile(`https://[a-z0-9]+\.lambda-url\.[a-z0-9-]+\.on\.aws(?:/[^\s"']*)?`)
+	lambdaARNPattern   = regexp.MustCompile(`arn:aws:lambda:[a-z0-9-]+:\d{12}:function:[a-zA-Z0-9_:-]+`)
+	apiGWARNPattern    = regexp.MustCompile(`arn:aws:execute-api:[a-z0-9-]+:\d{12}:[a-zA-Z0-9]+`)
+	apiGWURLEnvPattern = regexp.MustCompile(`https://[a-z0-9]+\.execute-api\.[a-z0-9-]+\.amazonaws\.com(?:/[^\s"']*)?`)
+	bedrockARNPattern  = regexp.MustCompile(`arn:aws:bedrock:[a-z0-9-]+:\d{12}:(?:agent|foundation-model|agent-alias)/[a-zA-Z0-9/_.-]+`)
+	functionURLPattern = regexp.MustCompile(`https://[a-z0-9]+\.lambda-url\.[a-z0-9-]+\.on\.aws(?:/[^\s"']*)?`)
 )
 
 // extractEnvVarReferences scans an agent's environment variables for patterns
@@ -1530,6 +1578,19 @@ var sensitiveActions = map[string]bool{
 	"dynamodb:GetItem":              true,
 }
 
+// decodeIAMPolicyDoc URL-decodes an IAM policy document as returned by
+// GetRolePolicy/GetPolicyVersion (percent-encoded JSON). Falls back to the
+// original string if decoding fails, since parseIAMPolicy's own
+// json.Unmarshal will then fail cleanly rather than silently succeed on
+// garbage — swallowing the decode error here must never turn into a
+// silently-empty permission set.
+func decodeIAMPolicyDoc(doc string) string {
+	if decoded, err := url.QueryUnescape(doc); err == nil {
+		return decoded
+	}
+	return doc
+}
+
 // parseIAMPolicy parses a JSON policy document and returns normalized permissions.
 func parseIAMPolicy(doc string) []types.NormalizedPermission {
 	var policy struct {
@@ -1583,6 +1644,40 @@ func parseIAMPolicy(doc string) []types.NormalizedPermission {
 		}
 	}
 	return perms
+}
+
+// appendSecretsManagerWildcardFinding checks perms for
+// secretsmanager:GetSecretValue granted with Resource: "*" and, if found,
+// appends a SECRETSMANAGER_WILDCARD_ACCESS finding. This is additive to
+// IAM_WILDCARD_RESOURCE (which already fires generically for this same
+// statement, since secretsmanager:GetSecretValue is in sensitiveActions) —
+// it reuses the same already-parsed perms rather than re-parsing the policy
+// document, and only adds the Secrets-Manager-specific classification on
+// top of the generic one.
+func appendSecretsManagerWildcardFinding(findings *[]types.FindingRecord, agent types.CanonicalAgentRecord, perms []types.NormalizedPermission, policyIdentifier string, now time.Time) {
+	for _, perm := range perms {
+		if perm.ResourceScope != "*" {
+			continue
+		}
+		if strings.EqualFold(perm.RawAction, "secretsmanager:GetSecretValue") {
+			evidence, _ := json.Marshal(map[string]string{
+				"roleArn": agent.IAMRoleARN,
+				"policy":  policyIdentifier,
+			})
+			*findings = append(*findings, types.FindingRecord{
+				RuleID:        "SECRETSMANAGER_WILDCARD_ACCESS",
+				Severity:      "HIGH",
+				AgentStableID: agent.StableID,
+				AgentName:     agent.Name,
+				Title:         "IAM policy grants secretsmanager:GetSecretValue on all secrets",
+				Description:   fmt.Sprintf("Role %s grants secretsmanager:GetSecretValue with Resource: \"*\" instead of scoping to the specific secret ARN(s) it needs.", agent.IAMRoleARN),
+				EvidenceJSON:  evidence,
+				DiscoveredAt:  now,
+				Plugin:        "aws",
+			})
+			return
+		}
+	}
 }
 
 // hasWildcardOnSensitive returns true if any sensitive action has Resource: *.
