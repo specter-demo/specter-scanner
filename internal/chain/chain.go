@@ -77,11 +77,21 @@ func buildChain(
 		ReconstructedAt:   now,
 	}
 
-	// Check if unattended (scheduler-triggered)
-	for _, e := range events {
-		if e.Principal.Type == "SCHEDULER" && e.Principal.ID != "" {
-			chain.IsUnattended = true
-			break
+	// Check if unattended (scheduler-triggered). Primary signal: direct
+	// enumeration (e.g. an EventBridge rule whose target is this root
+	// agent) has already authoritatively confirmed a human-approval-free
+	// trigger — see CanonicalAgentRecord.UnattendedTriggerConfirmed. Only
+	// when that's unset (enumeration found nothing for this agent's
+	// account/region, or wasn't available) do we fall back to inferring
+	// the same fact from a SCHEDULER-attributed CloudTrail event.
+	if root.UnattendedTriggerConfirmed {
+		chain.IsUnattended = true
+	} else {
+		for _, e := range events {
+			if e.Principal.Type == "SCHEDULER" && e.Principal.ID != "" {
+				chain.IsUnattended = true
+				break
+			}
 		}
 	}
 

@@ -35,10 +35,10 @@ const (
 type FederationStatus string
 
 const (
-	FederationStatusNotFederated         FederationStatus = "NOT_FEDERATED"
-	FederationStatusPartiallyFederated   FederationStatus = "PARTIALLY_FEDERATED"
-	FederationStatusFullyFederated       FederationStatus = "FULLY_FEDERATED"
-	FederationStatusUnregistered         FederationStatus = "UNREGISTERED"
+	FederationStatusNotFederated       FederationStatus = "NOT_FEDERATED"
+	FederationStatusPartiallyFederated FederationStatus = "PARTIALLY_FEDERATED"
+	FederationStatusFullyFederated     FederationStatus = "FULLY_FEDERATED"
+	FederationStatusUnregistered       FederationStatus = "UNREGISTERED"
 )
 
 // RiskTier classifies blast radius severity.
@@ -61,22 +61,22 @@ const (
 	EdgeTypeA2ACall       EdgeType = "A2A_CALL"
 	EdgeTypePartnerAgent  EdgeType = "PARTNER_AGENT"
 	EdgeTypeEnvURL        EdgeType = "ENV_URL"
-	EdgeTypeStaticRef     EdgeType = "STATIC_REF"    // statically discovered code reference
+	EdgeTypeStaticRef     EdgeType = "STATIC_REF"     // statically discovered code reference
 	EdgeTypeIAMPermission EdgeType = "IAM_PERMISSION" // IAM policy grants agent invocation
 )
 
 // A2ACard is the parsed agent card from the A2A protocol.
 type A2ACard struct {
-	SchemaVersion  string          `json:"schemaVersion"`
-	ProtocolVersion string         `json:"protocolVersion"`
-	Name           string          `json:"name"`
-	Description    string          `json:"description"`
-	Provider       A2AProvider     `json:"provider"`
-	Authentication A2AAuth         `json:"authentication"`
-	Capabilities   []string        `json:"capabilities"`
-	Signed         bool            `json:"signed"`
-	Version        string          `json:"version"`
-	Raw            json.RawMessage `json:"-"`
+	SchemaVersion   string          `json:"schemaVersion"`
+	ProtocolVersion string          `json:"protocolVersion"`
+	Name            string          `json:"name"`
+	Description     string          `json:"description"`
+	Provider        A2AProvider     `json:"provider"`
+	Authentication  A2AAuth         `json:"authentication"`
+	Capabilities    []string        `json:"capabilities"`
+	Signed          bool            `json:"signed"`
+	Version         string          `json:"version"`
+	Raw             json.RawMessage `json:"-"`
 }
 
 // A2AProvider contains provider/org info from the A2A card.
@@ -92,9 +92,9 @@ type A2AAuth struct {
 
 // MCPManifest represents a parsed MCP server manifest.
 type MCPManifest struct {
-	Name    string  `json:"name"`
-	Version string  `json:"version"`
-	Auth    MCPAuth `json:"auth"`
+	Name    string    `json:"name"`
+	Version string    `json:"version"`
+	Auth    MCPAuth   `json:"auth"`
 	Tools   []MCPTool `json:"tools"`
 }
 
@@ -131,30 +131,39 @@ type CanonicalAgentRecord struct {
 	ExternalID string `json:"externalId"` // ARN, GitHub repo path, etc.
 
 	// Discovery metadata
-	Name            string    `json:"name"`
-	Platform        string    `json:"platform"` // "AWS_LAMBDA" | "AWS_ECS" | "AWS_BEDROCK" | "GITHUB" | "EXTERNAL_HTTP"
-	AccountID       string    `json:"accountId,omitempty"`
-	Region          string    `json:"region,omitempty"`
-	PublicURL       string    `json:"publicUrl,omitempty"`
-	FirstSeenAt     *time.Time `json:"firstSeenAt,omitempty"` // nil = first scan
-	LastSeenAt      time.Time  `json:"lastSeenAt"`
+	Name        string     `json:"name"`
+	Platform    string     `json:"platform"` // "AWS_LAMBDA" | "AWS_ECS" | "AWS_BEDROCK" | "GITHUB" | "EXTERNAL_HTTP"
+	AccountID   string     `json:"accountId,omitempty"`
+	Region      string     `json:"region,omitempty"`
+	PublicURL   string     `json:"publicUrl,omitempty"`
+	FirstSeenAt *time.Time `json:"firstSeenAt,omitempty"` // nil = first scan
+	LastSeenAt  time.Time  `json:"lastSeenAt"`
 
 	// Framework detection (Classification section 6.1)
 	Framework           string  `json:"framework,omitempty"`
 	FrameworkConfidence float64 `json:"frameworkConfidence,omitempty"`
 
 	// Classification dimensions
-	VisibilityClass VisibilityClass `json:"visibilityClass"`
-	FunctionalClass FunctionalClass `json:"functionalClass"`
+	VisibilityClass  VisibilityClass  `json:"visibilityClass"`
+	FunctionalClass  FunctionalClass  `json:"functionalClass"`
 	FederationStatus FederationStatus `json:"federationStatus"`
 
 	// Boolean shortcuts
-	IsShadow   bool `json:"isShadow"`
+	IsShadow    bool `json:"isShadow"`
 	IsEphemeral bool `json:"isEphemeral"`
 
+	// UnattendedTriggerConfirmed is set when direct enumeration (e.g. an
+	// EventBridge rule whose target resolves directly to this agent) has
+	// authoritatively confirmed a human-approval-free invocation path,
+	// rather than that fact being inferred from CloudTrail actor patterns.
+	// Consumed by chain.Reconstruct as the primary signal for
+	// DelegationChainRecord.IsUnattended, which falls back to CloudTrail
+	// inference only when this is false.
+	UnattendedTriggerConfirmed bool `json:"unattendedTriggerConfirmed"`
+
 	// Governance
-	OwnerTag       string  `json:"ownerTag,omitempty"`
-	AgentClassTag  string  `json:"agentClassTag,omitempty"`
+	OwnerTag       string     `json:"ownerTag,omitempty"`
+	AgentClassTag  string     `json:"agentClassTag,omitempty"`
 	LastReviewedAt *time.Time `json:"lastReviewedAt,omitempty"`
 
 	// IAM
@@ -173,14 +182,14 @@ type CanonicalAgentRecord struct {
 	APIGatewayURL       string `json:"apiGatewayUrl,omitempty"`
 
 	// Protocol
-	A2ACard       *A2ACard    `json:"a2aCard,omitempty"`
-	A2ACardSigned bool        `json:"a2aCardSigned"`
-	A2ACardURL    string      `json:"a2aCardUrl,omitempty"`
+	A2ACard       *A2ACard     `json:"a2aCard,omitempty"`
+	A2ACardSigned bool         `json:"a2aCardSigned"`
+	A2ACardURL    string       `json:"a2aCardUrl,omitempty"`
 	MCPManifest   *MCPManifest `json:"mcpManifest,omitempty"`
 
 	// Risk
-	RiskScore    int      `json:"riskScore"`
-	BlastRadius  *BlastRadiusRecord `json:"blastRadius,omitempty"`
+	RiskScore   int                `json:"riskScore"`
+	BlastRadius *BlastRadiusRecord `json:"blastRadius,omitempty"`
 
 	// Ephemeral sub-agent signals
 	EphemeralSignals []EphemeralSignal `json:"ephemeralSignals,omitempty"`
@@ -188,20 +197,20 @@ type CanonicalAgentRecord struct {
 	// Environment variables (Lambda/ECS) — used for classification
 	// Never forwarded raw: only framework detection signals are recorded
 	EnvFrameworkSignals []string          `json:"envFrameworkSignals,omitempty"`
-	EnvMCPConfig        map[string]string `json:"envMcpConfig,omitempty"` // MCP-specific env vars
+	EnvMCPConfig        map[string]string `json:"envMcpConfig,omitempty"`    // MCP-specific env vars
 	EnvExternalURLs     map[string]string `json:"envExternalUrls,omitempty"` // discovered external agent URLs
 
 	// Visibility source
 	VisibilitySource string `json:"visibilitySource,omitempty"` // "SCANNER" | "TIER_2"
 
 	// Intent analysis (Phase 11.5 — static reference analysis)
-	IntentStatement  string   `json:"intentStatement,omitempty"`  // first meaningful sentence from intent file
-	IntentSource     string   `json:"intentSource,omitempty"`     // ".specter/manifest.yaml" | "AGENT.md" | "CLAUDE.md" | "README.md"
-	IntentConfidence float64  `json:"intentConfidence,omitempty"` // confidence in the parsed intent
-	AlignmentScore   float64  `json:"alignmentScore,omitempty"`   // 0.0–1.0 intent vs behaviour alignment
-	AlignmentTier    string   `json:"alignmentTier,omitempty"`    // "ALIGNED" | "PARTIAL" | "MISMATCHED" | "UNKNOWN"
+	IntentStatement   string   `json:"intentStatement,omitempty"`   // first meaningful sentence from intent file
+	IntentSource      string   `json:"intentSource,omitempty"`      // ".specter/manifest.yaml" | "AGENT.md" | "CLAUDE.md" | "README.md"
+	IntentConfidence  float64  `json:"intentConfidence,omitempty"`  // confidence in the parsed intent
+	AlignmentScore    float64  `json:"alignmentScore,omitempty"`    // 0.0–1.0 intent vs behaviour alignment
+	AlignmentTier     string   `json:"alignmentTier,omitempty"`     // "ALIGNED" | "PARTIAL" | "MISMATCHED" | "UNKNOWN"
 	AlignmentMismatch []string `json:"alignmentMismatch,omitempty"` // specific mismatches found
-	IntentOwner      string   `json:"intentOwner,omitempty"`      // owner declared in intent file
+	IntentOwner       string   `json:"intentOwner,omitempty"`       // owner declared in intent file
 
 	// Tier 2 GitHub-native discovery (agents found only via repo scanning, no AWS footprint)
 	RepoName            string  `json:"repoName,omitempty"`
@@ -212,10 +221,10 @@ type CanonicalAgentRecord struct {
 
 // AgentEdgeRecord represents a relationship between two agents.
 type AgentEdgeRecord struct {
-	SourceStableID string   `json:"sourceStableId"`
-	TargetStableID string   `json:"targetStableId"`
-	EdgeType       EdgeType `json:"edgeType"`
-	Confidence     float64  `json:"confidence"`
+	SourceStableID string    `json:"sourceStableId"`
+	TargetStableID string    `json:"targetStableId"`
+	EdgeType       EdgeType  `json:"edgeType"`
+	Confidence     float64   `json:"confidence"`
 	DiscoveredAt   time.Time `json:"discoveredAt"`
 	Evidence       string    `json:"evidence,omitempty"`
 }
@@ -226,8 +235,8 @@ type AgentEdgeRecord struct {
 type StaticRef struct {
 	SourceAgentExternalID string   `json:"sourceAgentExternalId"`
 	TargetExternalID      string   `json:"targetExternalId"` // ARN, URL, or other identifier
-	RefSource             string   `json:"refSource"`         // "ENV_VAR" | "IAM_POLICY" | "SOURCE_CODE"
-	EdgeType              EdgeType `json:"edgeType"`          // STATIC_REF or IAM_PERMISSION
+	RefSource             string   `json:"refSource"`        // "ENV_VAR" | "IAM_POLICY" | "SOURCE_CODE"
+	EdgeType              EdgeType `json:"edgeType"`         // STATIC_REF or IAM_PERMISSION
 	Confidence            float64  `json:"confidence"`
 	Evidence              string   `json:"evidence,omitempty"`
 }
@@ -242,7 +251,7 @@ type NormalizedPermission struct {
 
 // NormalizedCredential describes the credential type used by an agent.
 type NormalizedCredential struct {
-	Type        string `json:"type"`        // "SHORT_LIVED_ROLE" | "SERVICE_ACCOUNT" | etc.
+	Type        string `json:"type"` // "SHORT_LIVED_ROLE" | "SERVICE_ACCOUNT" | etc.
 	Platform    string `json:"platform"`
 	RawType     string `json:"rawType"`
 	Description string `json:"description"`
@@ -250,37 +259,37 @@ type NormalizedCredential struct {
 
 // FindingRecord represents a security finding discovered by the scanner.
 type FindingRecord struct {
-	RuleID       string          `json:"ruleId"`       // e.g. "IAM_WILDCARD_RESOURCE"
-	Severity     string          `json:"severity"`     // "CRITICAL" | "HIGH" | "MEDIUM" | "LOW" | "INFO"
-	AgentStableID string         `json:"agentStableId"`
-	AgentName    string          `json:"agentName"`
-	Title        string          `json:"title"`
-	Description  string          `json:"description"`
-	EvidenceJSON json.RawMessage `json:"evidenceJson,omitempty"`
-	DiscoveredAt time.Time       `json:"discoveredAt"`
-	Plugin       string          `json:"plugin"` // "aws" | "github" | "a2a" | "mcp"
+	RuleID        string          `json:"ruleId"`   // e.g. "IAM_WILDCARD_RESOURCE"
+	Severity      string          `json:"severity"` // "CRITICAL" | "HIGH" | "MEDIUM" | "LOW" | "INFO"
+	AgentStableID string          `json:"agentStableId"`
+	AgentName     string          `json:"agentName"`
+	Title         string          `json:"title"`
+	Description   string          `json:"description"`
+	EvidenceJSON  json.RawMessage `json:"evidenceJson,omitempty"`
+	DiscoveredAt  time.Time       `json:"discoveredAt"`
+	Plugin        string          `json:"plugin"` // "aws" | "github" | "a2a" | "mcp"
 }
 
 // NormalizedEvent is a normalized audit log event from any cloud platform.
 type NormalizedEvent struct {
-	EventID         string    `json:"eventId"`
-	Timestamp       time.Time `json:"timestamp"`
-	Principal       Principal `json:"principal"`
-	Action          string    `json:"action"`         // normalized: "storage.read", "secret.read"
-	PlatformAction  string    `json:"platformAction"` // raw: "s3:GetObject"
-	Resource        Resource  `json:"resource"`
-	Outcome         string    `json:"outcome"` // "SUCCESS" | "FAILURE" | "DENIED"
-	SourcePlatform  string    `json:"sourcePlatform"`
-	SourceRegion    string    `json:"sourceRegion"`
-	CredentialType  string    `json:"credentialType"`
-	RFC8693Present  bool      `json:"rfc8693Present"`
-	OnBehalfOf      string    `json:"onBehalfOf,omitempty"`
-	SessionID       string    `json:"sessionId,omitempty"`
-	CorrelationID   string    `json:"correlationId"`
+	EventID        string    `json:"eventId"`
+	Timestamp      time.Time `json:"timestamp"`
+	Principal      Principal `json:"principal"`
+	Action         string    `json:"action"`         // normalized: "storage.read", "secret.read"
+	PlatformAction string    `json:"platformAction"` // raw: "s3:GetObject"
+	Resource       Resource  `json:"resource"`
+	Outcome        string    `json:"outcome"` // "SUCCESS" | "FAILURE" | "DENIED"
+	SourcePlatform string    `json:"sourcePlatform"`
+	SourceRegion   string    `json:"sourceRegion"`
+	CredentialType string    `json:"credentialType"`
+	RFC8693Present bool      `json:"rfc8693Present"`
+	OnBehalfOf     string    `json:"onBehalfOf,omitempty"`
+	SessionID      string    `json:"sessionId,omitempty"`
+	CorrelationID  string    `json:"correlationId"`
 
 	// Extra CloudTrail fields used for chain reconstruction
-	AssumedRoleARN  string `json:"assumedRoleArn,omitempty"`
-	CallerARN       string `json:"callerArn,omitempty"`
+	AssumedRoleARN string `json:"assumedRoleArn,omitempty"`
+	CallerARN      string `json:"callerArn,omitempty"`
 }
 
 // Principal is the identity that performed an action.
@@ -293,24 +302,24 @@ type Principal struct {
 // Resource is the target of an action.
 type Resource struct {
 	ID       string `json:"id"`
-	Type     string `json:"type"`     // "s3_bucket" | "lambda_function" | "secret" | etc.
+	Type     string `json:"type"` // "s3_bucket" | "lambda_function" | "secret" | etc.
 	Platform string `json:"platform"`
 	Region   string `json:"region"`
 }
 
 // DelegationChainRecord represents a reconstructed causal chain of agent actions.
 type DelegationChainRecord struct {
-	ChainID                 string          `json:"chainId"`
-	RootAgentStableID       string          `json:"rootAgentStableId"`
-	RootPrincipalType       string          `json:"rootPrincipalType"`
-	RootIntent              string          `json:"rootIntent"`
-	Hops                    []DelegationHop `json:"hops"`
-	ChainBreakAt            *int            `json:"chainBreakAt,omitempty"` // hop index where RFC8693 breaks
-	IsUnattended            bool            `json:"isUnattended"`
-	RFC8693Compliant        bool            `json:"rfc8693Compliant"`
-	ReconstructionConfidence float64        `json:"reconstructionConfidence"`
-	PartialChain            bool            `json:"partialChain"`
-	ReconstructedAt         time.Time       `json:"reconstructedAt"`
+	ChainID                  string          `json:"chainId"`
+	RootAgentStableID        string          `json:"rootAgentStableId"`
+	RootPrincipalType        string          `json:"rootPrincipalType"`
+	RootIntent               string          `json:"rootIntent"`
+	Hops                     []DelegationHop `json:"hops"`
+	ChainBreakAt             *int            `json:"chainBreakAt,omitempty"` // hop index where RFC8693 breaks
+	IsUnattended             bool            `json:"isUnattended"`
+	RFC8693Compliant         bool            `json:"rfc8693Compliant"`
+	ReconstructionConfidence float64         `json:"reconstructionConfidence"`
+	PartialChain             bool            `json:"partialChain"`
+	ReconstructedAt          time.Time       `json:"reconstructedAt"`
 }
 
 // DelegationHop is a single step in a delegation chain.
@@ -323,25 +332,25 @@ type DelegationHop struct {
 
 // BlastRadiusRecord captures the computed blast radius for an agent.
 type BlastRadiusRecord struct {
-	Tier                RiskTier               `json:"tier"`
-	Score               int                    `json:"score"`
-	UniquePermissions   int                    `json:"uniquePermissions"`
-	MaxDataScope        string                 `json:"maxDataScope"` // "ACCOUNT_WIDE" | "MULTI_SERVICE" | "SINGLE_SERVICE" | "NARROW"
-	ReachableAgentIDs   []string               `json:"reachableAgentIds"`
-	ReachableServices   []string               `json:"reachableServices"`
-	CrossOrgEdges       []string               `json:"crossOrgEdges"`
+	Tier                  RiskTier               `json:"tier"`
+	Score                 int                    `json:"score"`
+	UniquePermissions     int                    `json:"uniquePermissions"`
+	MaxDataScope          string                 `json:"maxDataScope"` // "ACCOUNT_WIDE" | "MULTI_SERVICE" | "SINGLE_SERVICE" | "NARROW"
+	ReachableAgentIDs     []string               `json:"reachableAgentIds"`
+	ReachableServices     []string               `json:"reachableServices"`
+	CrossOrgEdges         []string               `json:"crossOrgEdges"`
 	NormalizedPermissions []NormalizedPermission `json:"normalizedPermissions,omitempty"`
-	ComputedAt          time.Time              `json:"computedAt"`
+	ComputedAt            time.Time              `json:"computedAt"`
 }
 
 // ScanPayload is the full payload posted to the platform ingest endpoint.
 type ScanPayload struct {
-	ScanID        string                 `json:"scanId"`
-	OrgID         string                 `json:"orgId"`
-	ScannerVersion string               `json:"scannerVersion"`
-	ScannedAt     time.Time              `json:"scannedAt"`
-	Agents        []CanonicalAgentRecord `json:"agents"`
-	Edges         []AgentEdgeRecord      `json:"edges"`
-	Findings      []FindingRecord        `json:"findings"`
-	Chains        []DelegationChainRecord `json:"chains"`
+	ScanID         string                  `json:"scanId"`
+	OrgID          string                  `json:"orgId"`
+	ScannerVersion string                  `json:"scannerVersion"`
+	ScannedAt      time.Time               `json:"scannedAt"`
+	Agents         []CanonicalAgentRecord  `json:"agents"`
+	Edges          []AgentEdgeRecord       `json:"edges"`
+	Findings       []FindingRecord         `json:"findings"`
+	Chains         []DelegationChainRecord `json:"chains"`
 }

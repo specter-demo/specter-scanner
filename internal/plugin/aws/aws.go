@@ -235,6 +235,14 @@ func (p *Plugin) Scan(ctx context.Context) (*plugin.ScanResult, error) {
 	}
 	result.Events = events
 
+	// Step 5b: EventBridge rule/target enumeration — authoritative
+	// unattended-trigger confirmation for already-discovered agents,
+	// primary signal ahead of the CloudTrail-inferred SCHEDULER check in
+	// chain.Reconstruct. Mutates result.Agents in place by StableID, so it
+	// must run after Steps 1-3 (Lambda/ECS/Bedrock discovery) populated it
+	// and before anything else reads IsUnattended downstream.
+	p.scanEventBridgeTriggers(ctx, result.Agents)
+
 	// Step 6: Source/CI-CD (CodeCommit, CodeBuild, CodePipeline, CodeDeploy, ECR)
 	cicdFindings, err := p.scanCICD(ctx, result.Agents)
 	if err != nil {
