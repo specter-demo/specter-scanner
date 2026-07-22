@@ -18,7 +18,6 @@ import (
 	"log"
 	"net/http"
 	"os"
-	"strings"
 	"sync"
 	"time"
 
@@ -815,7 +814,10 @@ func writeStandaloneReport(cfg *config.ScannerConfig, payload types.ScanPayload,
 		format = "html"
 	}
 
-	// Determine output file path
+	// Determine output file path. An explicit --output-file is used exactly
+	// as given (e.g. /dev/stdout) — extension normalisation only applies to
+	// the generated default name, so it never rewrites a path the caller
+	// chose deliberately.
 	outPath := cfg.OutputFile
 	if outPath == "" {
 		if format == "json" {
@@ -823,10 +825,6 @@ func writeStandaloneReport(cfg *config.ScannerConfig, payload types.ScanPayload,
 		} else {
 			outPath = "specter-report.html"
 		}
-	}
-	// Normalise extension for json output
-	if format == "json" && !strings.HasSuffix(outPath, ".json") {
-		outPath = strings.TrimSuffix(outPath, ".html") + ".json"
 	}
 
 	var fileBytes []byte
