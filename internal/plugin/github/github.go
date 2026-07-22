@@ -389,18 +389,8 @@ func (p *Plugin) scanRepo(ctx context.Context, client *gogithub.Client, repo *go
 	framework, confidence, isMCP := detectFrameworkFromManifest(allManifest)
 
 	// Layer 3: config files override
-	if content.LangGraphJSON != "" {
-		framework = "LangGraph"
-		confidence = 0.97
-		isMCP = false
-	} else if content.CrewDir {
-		framework = "CrewAI"
-		confidence = 0.95
-		isMCP = false
-	} else if content.MCPJson != "" {
-		framework = "MCP SDK"
-		confidence = 0.98
-		isMCP = true
+	if fw, conf, mcp := applyConfigFileOverride(content); fw != "" {
+		framework, confidence, isMCP = fw, conf, mcp
 	}
 
 	if framework != "" {
@@ -556,6 +546,26 @@ func analyzeWorkflow(wf workflowFile, agentStableID, agentName string, now time.
 	}
 
 	return findings
+}
+
+// applyConfigFileOverride returns the framework, confidence, and isMCP that a
+// Layer 3 config-file signal implies, given content already fetched for a
+// repo. A recognised config file (langgraph.json, .crew/, mcp.json) is a
+// stronger, more direct signal than a manifest dependency line, so it always
+// overrides Layer 1's detectFrameworkFromManifest result when present.
+// Returns ("", 0, false) when no config file was found — callers keep
+// whatever Layer 1 already determined.
+func applyConfigFileOverride(content *GitHubRepoContent) (framework string, confidence float64, isMCP bool) {
+	switch {
+	case content.LangGraphJSON != "":
+		return "LangGraph", 0.97, false
+	case content.CrewDir:
+		return "CrewAI", 0.95, false
+	case content.MCPJson != "":
+		return "MCP SDK", 0.98, true
+	default:
+		return "", 0, false
+	}
 }
 
 func detectFrameworkFromManifest(content string) (framework string, confidence float64, isMCP bool) {

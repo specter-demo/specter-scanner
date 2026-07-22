@@ -433,13 +433,8 @@ func (p *Plugin) scanRepoTier2(ctx context.Context, client *gogithub.Client, rep
 	allManifest := content.RequirementsTxt + "\n" + content.PyprojectToml + "\n" + content.PackageJSON
 	framework, frameworkConfidence, isMCP := detectFrameworkFromManifest(allManifest)
 
-	switch {
-	case content.LangGraphJSON != "":
-		framework, frameworkConfidence, isMCP = "LangGraph", 0.97, false
-	case content.CrewDir:
-		framework, frameworkConfidence, isMCP = "CrewAI", 0.95, false
-	case content.MCPJson != "":
-		framework, frameworkConfidence, isMCP = "MCP SDK", 0.98, true
+	if fw, conf, mcp := applyConfigFileOverride(content); fw != "" {
+		framework, frameworkConfidence, isMCP = fw, conf, mcp
 	}
 
 	entrypointSignal := false
