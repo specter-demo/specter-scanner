@@ -552,3 +552,157 @@ func TestExtractIAMPermissionRefs_UnrelatedActionIgnored(t *testing.T) {
 		t.Errorf("expected no ref for an action outside the allowlist, got %d", len(refs))
 	}
 }
+
+// ── IAM_PASSROLE_WILDCARD / ECS_RUNTASK_WILDCARD ─────────────────────────────
+//
+// iam:PassRole and ecs:RunTask with Resource: "*" were confirmed missing
+// from sensitiveActions (git history: never present, never removed — an
+// oversight at the generic-check level, not a deliberate exclusion).
+// scanCodeBuild's hasWildcardPassRole already made this exact check for
+// CodeBuild service roles specifically; these tests cover the generalized
+// version that runs for every Lambda/ECS agent via enrichIAMRole.
+
+func TestAppendPassRoleAndRunTaskWildcardFindings_PassRoleWildcard_Fires(t *testing.T) {
+	agent := types.CanonicalAgentRecord{
+		StableID:   "example-agent-stable-id",
+		Name:       "example-agent",
+		IAMRoleARN: "arn:aws:iam::111111111111:role/example-agent-role",
+	}
+	perms := []types.NormalizedPermission{
+		{RawAction: "iam:PassRole", ResourceScope: "*"},
+	}
+	var findings []types.FindingRecord
+	appendPassRoleAndRunTaskWildcardFindings(&findings, agent, perms, time.Now())
+
+	if len(findings) != 1 {
+		t.Fatalf("expected 1 finding, got %d: %+v", len(findings), findings)
+	}
+	f := findings[0]
+	if f.RuleID != "IAM_PASSROLE_WILDCARD" {
+		t.Errorf("expected RuleID IAM_PASSROLE_WILDCARD, got %q", f.RuleID)
+	}
+	if f.Severity != "HIGH" {
+		t.Errorf("expected Severity HIGH, got %q", f.Severity)
+	}
+}
+
+func TestAppendPassRoleAndRunTaskWildcardFindings_PassRoleScoped_NoFinding(t *testing.T) {
+	agent := types.CanonicalAgentRecord{StableID: "example-agent-stable-id", Name: "example-agent"}
+	perms := []types.NormalizedPermission{
+		{RawAction: "iam:PassRole", ResourceScope: "arn:aws:iam::111111111111:role/example-scoped-role"},
+	}
+	var findings []types.FindingRecord
+	appendPassRoleAndRunTaskWildcardFindings(&findings, agent, perms, time.Now())
+	if len(findings) != 0 {
+		t.Errorf("expected no finding for iam:PassRole scoped to a specific role ARN, got %+v", findings)
+	}
+}
+
+func TestAppendPassRoleAndRunTaskWildcardFindings_RunTaskWildcard_Fires(t *testing.T) {
+	agent := types.CanonicalAgentRecord{
+		StableID:   "example-agent-stable-id",
+		Name:       "example-agent",
+		IAMRoleARN: "arn:aws:iam::111111111111:role/example-agent-role",
+	}
+	perms := []types.NormalizedPermission{
+		{RawAction: "ecs:RunTask", ResourceScope: "*"},
+	}
+	var findings []types.FindingRecord
+	appendPassRoleAndRunTaskWildcardFindings(&findings, agent, perms, time.Now())
+
+	if len(findings) != 1 {
+		t.Fatalf("expected 1 finding, got %d: %+v", len(findings), findings)
+	}
+	f := findings[0]
+	if f.RuleID != "ECS_RUNTASK_WILDCARD" {
+		t.Errorf("expected RuleID ECS_RUNTASK_WILDCARD, got %q", f.RuleID)
+	}
+	if f.Severity != "MEDIUM" {
+		t.Errorf("expected Severity MEDIUM (lower than IAM_PASSROLE_WILDCARD's HIGH), got %q", f.Severity)
+	}
+}
+
+func TestAppendPassRoleAndRunTaskWildcardFindings_RunTaskScoped_NoFinding(t *testing.T) {
+	agent := types.CanonicalAgentRecord{StableID: "example-agent-stable-id", Name: "example-agent"}
+	perms := []types.NormalizedPermission{
+		{RawAction: "ecs:RunTask", ResourceScope: "arn:aws:ecs:us-east-1:111111111111:task-definition/example-task:*"},
+	}
+	var findings []types.FindingRecord
+	appendPassRoleAndRunTaskWildcardFindings(&findings, agent, perms, time.Now())
+	if len(findings) != 0 {
+		t.Errorf("expected no finding for ecs:RunTask scoped to a specific task definition, got %+v", findings)
+	}
+}
+
+// TestAppendPassRoleAndRunTaskWildcardFindings_BothActionsPresent_TwoDistinctFindings
+// is a regression test for the exact design choice this rule split makes:
+// a role with both wildcard grants must produce two separately-identifiable
+// findings, not one generic one that loses which specific action was
+// involved.
+func TestAppendPassRoleAndRunTaskWildcardFindings_BothActionsPresent_TwoDistinctFindings(t *testing.T) {
+	agent := types.CanonicalAgentRecord{
+		StableID:   "example-agent-stable-id",
+		Name:       "example-agent",
+		IAMRoleARN: "arn:aws:iam::111111111111:role/example-agent-role",
+	}
+	perms := []types.NormalizedPermission{
+		{RawAction: "iam:PassRole", ResourceScope: "*"},
+		{RawAction: "ecs:RunTask", ResourceScope: "*"},
+	}
+	var findings []types.FindingRecord
+	appendPassRoleAndRunTaskWildcardFindings(&findings, agent, perms, time.Now())
+
+	if len(findings) != 2 {
+		t.Fatalf("expected 2 distinct findings, got %d: %+v", len(findings), findings)
+	}
+	ruleIDs := map[string]bool{}
+	for _, f := range findings {
+		ruleIDs[f.RuleID] = true
+	}
+	if !ruleIDs["IAM_PASSROLE_WILDCARD"] || !ruleIDs["ECS_RUNTASK_WILDCARD"] {
+		t.Errorf("expected both IAM_PASSROLE_WILDCARD and ECS_RUNTASK_WILDCARD to fire independently, got %+v", findings)
+	}
+}
+
+func TestAppendPassRoleAndRunTaskWildcardFindings_NeitherActionPresent_NoFindings(t *testing.T) {
+	agent := types.CanonicalAgentRecord{StableID: "example-agent-stable-id", Name: "example-agent"}
+	perms := []types.NormalizedPermission{
+		{RawAction: "logs:PutLogEvents", ResourceScope: "*"},
+	}
+	var findings []types.FindingRecord
+	appendPassRoleAndRunTaskWildcardFindings(&findings, agent, perms, time.Now())
+	if len(findings) != 0 {
+		t.Errorf("expected no findings when neither iam:PassRole nor ecs:RunTask is present, got %+v", findings)
+	}
+}
+
+func TestAppendPassRoleAndRunTaskWildcardFindings_EmptyPerms_NoFindings(t *testing.T) {
+	agent := types.CanonicalAgentRecord{StableID: "example-agent-stable-id", Name: "example-agent"}
+	var findings []types.FindingRecord
+	appendPassRoleAndRunTaskWildcardFindings(&findings, agent, nil, time.Now())
+	if len(findings) != 0 {
+		t.Errorf("expected no findings for empty perms, got %+v", findings)
+	}
+}
+
+// TestAppendPassRoleAndRunTaskWildcardFindings_DoesNotDuplicateAcrossRepeatedGrant
+// is a regression test for enrichIAMRole's call site: this function is now
+// called once against the full combined agent.IAMPermissions (inline +
+// managed policies already merged), specifically so a role granting the
+// same wildcard action in two different policies produces one finding, not
+// one per policy — unlike appendSecretsManagerWildcardFinding, which is
+// called once per policy and has no such dedup. Passing perms with the same
+// action appearing twice (simulating what the combined IAMPermissions slice
+// would look like) must still produce exactly one finding per rule.
+func TestAppendPassRoleAndRunTaskWildcardFindings_DoesNotDuplicateAcrossRepeatedGrant(t *testing.T) {
+	agent := types.CanonicalAgentRecord{StableID: "example-agent-stable-id", Name: "example-agent"}
+	perms := []types.NormalizedPermission{
+		{RawAction: "iam:PassRole", ResourceScope: "*"}, // from an inline policy
+		{RawAction: "iam:PassRole", ResourceScope: "*"}, // from a managed policy, same grant
+	}
+	var findings []types.FindingRecord
+	appendPassRoleAndRunTaskWildcardFindings(&findings, agent, perms, time.Now())
+	if len(findings) != 1 {
+		t.Errorf("expected exactly 1 IAM_PASSROLE_WILDCARD finding even though the grant appears twice in perms, got %d: %+v", len(findings), findings)
+	}
+}

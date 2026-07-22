@@ -551,6 +551,15 @@ func (p *Plugin) enrichIAMRole(ctx context.Context, agent types.CanonicalAgentRe
 		}
 	}
 
+	// iam:PassRole / ecs:RunTask wildcard checks — deliberately not folded
+	// into sensitiveActions/IAM_WILDCARD_RESOURCE above (see the two rules'
+	// own comments for why each gets its own name), and run once here
+	// against the full combined agent.IAMPermissions (inline + managed)
+	// rather than per-policy like appendSecretsManagerWildcardFinding above,
+	// so a role with the same wildcard grant repeated across multiple
+	// policies produces one finding, not one per policy.
+	appendPassRoleAndRunTaskWildcardFindings(findings, agent, agent.IAMPermissions, now)
+
 	return agent
 }
 
@@ -1760,6 +1769,77 @@ func appendSecretsManagerWildcardFinding(findings *[]types.FindingRecord, agent 
 			})
 			return
 		}
+	}
+}
+
+// passRoleAndRunTaskChecks are the two actions this session found missing
+// from sensitiveActions (confirmed via git history: never present, and
+// never deliberately removed — an oversight, not a considered exclusion at
+// the generic-check level). scanCodeBuild's hasWildcardPassRole already
+// made the equivalent check for CodeBuild service roles specifically, with
+// its own comment explaining why it built a separate check rather than
+// adding iam:PassRole to sensitiveActions: a broad PassRole grant is common
+// enough on ordinary (non-CI) roles that folding it into the same generic
+// IAM_WILDCARD_RESOURCE bucket would bury a genuinely distinct,
+// well-known privilege-escalation vector inside a catch-all label. Two
+// named rules, not one — a reader seeing IAM_PASSROLE_WILDCARD or
+// ECS_RUNTASK_WILDCARD understands the specific risk without opening the
+// evidence; IAM_WILDCARD_RESOURCE doesn't say which sensitive action was
+// involved without doing that. ecs:RunTask is real but meaningfully lower
+// severity than PassRole (it lets a role launch tasks, not escalate
+// privilege by handing another service a more-privileged role), so it's a
+// separate rule rather than the same one — that distinctness would be lost
+// if both actions shared one rule ID.
+var passRoleAndRunTaskChecks = []struct {
+	action   string
+	ruleID   string
+	severity string
+	title    string
+	descFmt  string // one %s: agent.IAMRoleARN
+}{
+	{
+		action:   "iam:passrole",
+		ruleID:   "IAM_PASSROLE_WILDCARD",
+		severity: "HIGH",
+		title:    "IAM policy grants iam:PassRole on all roles",
+		descFmt:  "Role %s grants iam:PassRole with Resource: \"*\" instead of scoped role ARNs — a privilege-escalation path, since it can pass any role in the account to a service that will assume it, including roles more privileged than intended.",
+	},
+	{
+		action:   "ecs:runtask",
+		ruleID:   "ECS_RUNTASK_WILDCARD",
+		severity: "MEDIUM",
+		title:    "IAM policy grants ecs:RunTask on all resources",
+		descFmt:  "Role %s grants ecs:RunTask with Resource: \"*\" instead of scoping to specific task definitions or clusters, letting it launch arbitrary ECS tasks.",
+	},
+}
+
+// appendPassRoleAndRunTaskWildcardFindings checks perms for iam:PassRole and
+// ecs:RunTask granted with Resource: "*" and appends a distinctly-named
+// finding for each one found — see passRoleAndRunTaskChecks's comment for
+// why these aren't folded into the generic IAM_WILDCARD_RESOURCE check.
+// Reuses hasActionOnWildcard (cicd.go), the same boolean check
+// scanCodeBuild's hasWildcardPassRole already uses for the CodeBuild-
+// specific case this generalizes.
+func appendPassRoleAndRunTaskWildcardFindings(findings *[]types.FindingRecord, agent types.CanonicalAgentRecord, perms []types.NormalizedPermission, now time.Time) {
+	for _, check := range passRoleAndRunTaskChecks {
+		if !hasActionOnWildcard(perms, check.action) {
+			continue
+		}
+		evidence, _ := json.Marshal(map[string]string{
+			"roleArn": agent.IAMRoleARN,
+			"action":  check.action,
+		})
+		*findings = append(*findings, types.FindingRecord{
+			RuleID:        check.ruleID,
+			Severity:      check.severity,
+			AgentStableID: agent.StableID,
+			AgentName:     agent.Name,
+			Title:         check.title,
+			Description:   fmt.Sprintf(check.descFmt, agent.IAMRoleARN),
+			EvidenceJSON:  evidence,
+			DiscoveredAt:  now,
+			Plugin:        "aws",
+		})
 	}
 }
 
