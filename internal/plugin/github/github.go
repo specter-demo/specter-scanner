@@ -255,6 +255,15 @@ func (p *Plugin) Scan(ctx context.Context) (*plugin.ScanResult, error) {
 		opts.Page = resp.NextPage
 	}
 
+	// OIDC-to-agent correlation (spec §5.2 step 6) — independent of
+	// name-based matching above: a deploying repo doesn't need to share a
+	// name with the agent its OIDC role deploys to. Checks every Phase 1
+	// seed agent's AWS-parsed trust-policy subjects against every repo this
+	// scan actually found, so a stale/decommissioned trust policy
+	// referencing a repo that no longer exists in the org doesn't produce
+	// an edge.
+	result.Edges = append(result.Edges, correlateOIDCDeployEdges(p.cfg.OrgID, p.ghCfg.Org, allRepos, p.cfg.SeedAgents)...)
+
 	// ── Tier 2: GitHub-native agent discovery ────────────────────────────────
 	// Find AI agents that exist only in GitHub repos with no AWS footprint.
 	// Skip repos that already matched a seed agent from Phase 1 (AWS), since

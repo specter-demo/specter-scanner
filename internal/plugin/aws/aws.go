@@ -452,11 +452,18 @@ func (p *Plugin) enrichIAMRole(ctx context.Context, agent types.CanonicalAgentRe
 	}
 	roleName := parts[len(parts)-1]
 
-	// Get role creation date
+	// Get role creation date, and check the trust policy for GitHub Actions
+	// OIDC federation (spec §5.2 step 6) — GetRole already returns
+	// AssumeRolePolicyDocument in the same response, so this costs no
+	// additional API call.
 	roleOut, err := iamClient.GetRole(ctx, &iam.GetRoleInput{RoleName: aws.String(roleName)})
 	if err == nil && roleOut.Role.CreateDate != nil {
 		createdAt := *roleOut.Role.CreateDate
 		agent.IAMRoleCreatedAt = &createdAt
+	}
+	if err == nil && roleOut.Role.AssumeRolePolicyDocument != nil {
+		trustDoc := decodeIAMPolicyDoc(aws.ToString(roleOut.Role.AssumeRolePolicyDocument))
+		agent.OIDCTrustSubjects = parseGitHubOIDCTrustSubjects(trustDoc)
 	}
 
 	// Get inline policies
@@ -941,8 +948,13 @@ func (p *Plugin) scanECS(ctx context.Context) ([]types.CanonicalAgentRecord, []t
 							tags[aws.ToString(t.Key)] = aws.ToString(t.Value)
 						}
 
-						// Get task definition env vars
+						// Get task definition env vars and task role ARN — one
+						// DescribeTaskDefinition call covers both; the task
+						// role ARN feeds enrichIAMRole below (trust-policy
+						// OIDC parsing) the same way Lambda's execution role
+						// already does.
 						envVars := map[string]string{}
+						var taskRoleArn string
 						if svc.TaskDefinition != nil {
 							tdOut, err := ecsClient.DescribeTaskDefinition(ctx, &ecssvc.DescribeTaskDefinitionInput{
 								TaskDefinition: svc.TaskDefinition,
@@ -953,12 +965,15 @@ func (p *Plugin) scanECS(ctx context.Context) ([]types.CanonicalAgentRecord, []t
 										envVars[aws.ToString(ev.Name)] = aws.ToString(ev.Value)
 									}
 								}
+								taskRoleArn = aws.ToString(tdOut.TaskDefinition.TaskRoleArn)
 							}
 						}
 
 						agent, svcFindings, svcRefs := p.buildECSServiceAgent(
+							ctx,
 							aws.ToString(svc.ServiceArn),
 							aws.ToString(svc.TaskDefinition),
+							taskRoleArn,
 							tags,
 							envVars,
 							clusterARN,
@@ -979,7 +994,7 @@ func (p *Plugin) scanECS(ctx context.Context) ([]types.CanonicalAgentRecord, []t
 	return agents, findings, refs, nil
 }
 
-func (p *Plugin) buildECSServiceAgent(svcArn, taskDefArn string, tags, envVars map[string]string, clusterARN string) (types.CanonicalAgentRecord, []types.FindingRecord, []types.StaticRef) {
+func (p *Plugin) buildECSServiceAgent(ctx context.Context, svcArn, taskDefArn, taskRoleArn string, tags, envVars map[string]string, clusterARN string) (types.CanonicalAgentRecord, []types.FindingRecord, []types.StaticRef) {
 	now := time.Now().UTC()
 	var findings []types.FindingRecord
 
@@ -995,6 +1010,7 @@ func (p *Plugin) buildECSServiceAgent(svcArn, taskDefArn string, tags, envVars m
 		OrgID:            p.cfg.OrgID,
 		Region:           p.awsCfg.Region,
 		LastSeenAt:       now,
+		IAMRoleARN:       taskRoleArn,
 		VisibilitySource: "SCANNER",
 	}
 
@@ -1007,6 +1023,15 @@ func (p *Plugin) buildECSServiceAgent(svcArn, taskDefArn string, tags, envVars m
 	// Governance tags
 	agent.OwnerTag = tags["specter:owner"]
 	agent.AgentClassTag = tags["specter:agent-class"]
+
+	// IAM role: policies, wildcard detection, and trust-policy OIDC parsing —
+	// same enrichment Lambda agents already get. Previously ECS agents had
+	// no IAMRoleARN at all (the task role ARN was fetched for env vars but
+	// never propagated), so extractIAMPermissionRefs below could never find
+	// anything for an ECS agent regardless of the role's real permissions.
+	if agent.IAMRoleARN != "" {
+		agent = p.enrichIAMRole(ctx, agent, &findings)
+	}
 
 	// Framework detection from env vars (Signal Layer 4)
 	agent = p.detectFrameworkFromEnv(agent, envVars)
@@ -1045,8 +1070,6 @@ func (p *Plugin) buildECSServiceAgent(svcArn, taskDefArn string, tags, envVars m
 	// Static reference extraction (Phase 11.5)
 	var refs []types.StaticRef
 	refs = append(refs, extractEnvVarReferences(agent, envVars)...)
-	// ECS task roles are enriched separately via scanIAMProvenance, so IAM refs
-	// can only be extracted if the role is known at this point (often it isn't).
 	refs = append(refs, extractIAMPermissionRefs(agent)...)
 
 	_ = taskDefArn

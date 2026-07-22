@@ -172,6 +172,16 @@ type CanonicalAgentRecord struct {
 	CreatedByIAMUser string     `json:"createdByIamUser,omitempty"`
 	CreatedByIAMAt   *time.Time `json:"createdByIamAt,omitempty"`
 
+	// OIDCTrustSubjects holds every GitHub Actions OIDC federation subject
+	// claim found in this agent's IAM role trust policy (e.g.
+	// "repo:example-org/example-repo:*"), populated by the AWS plugin.
+	// Consumed by the GitHub plugin's Phase 2 correlation to emit an
+	// EdgeTypeOIDCDeploy edge from the matching repo to this agent —
+	// specter-scanner-spec.docx §5.2 step 6. Empty for the overwhelmingly
+	// common case (a role trusting ecs-tasks/lambda.amazonaws.com, not an
+	// external OIDC provider), not an error.
+	OIDCTrustSubjects []string `json:"oidcTrustSubjects,omitempty"`
+
 	// Permissions
 	IAMPermissions []NormalizedPermission `json:"iamPermissions,omitempty"`
 	HasWildcard    bool                   `json:"hasWildcard"`

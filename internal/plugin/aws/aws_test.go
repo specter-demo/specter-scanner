@@ -28,14 +28,18 @@ func TestDiscoversLambdaAgents(t *testing.T) {
 	envVars2 := map[string]string{"OPENAI_API_KEY": "sk-xxx"}
 
 	agent1, _, _ := p.buildECSServiceAgent(
+		context.Background(),
 		"arn:aws:ecs:us-east-1:123456789:service/cluster/agent-one",
+		"",
 		"",
 		map[string]string{"specter:owner": "team-a"},
 		envVars1,
 		"arn:aws:ecs:us-east-1:123456789:cluster/cluster",
 	)
 	agent2, _, _ := p.buildECSServiceAgent(
+		context.Background(),
 		"arn:aws:ecs:us-east-1:123456789:service/cluster/agent-two",
+		"",
 		"",
 		map[string]string{"specter:owner": "team-b"},
 		envVars2,
@@ -76,7 +80,9 @@ func TestShadowAgentNoOwnerTag(t *testing.T) {
 	}
 
 	_, findings, _ := p.buildECSServiceAgent(
+		context.Background(),
 		"arn:aws:ecs:us-east-1:123456789:service/cluster/shadow-fn",
+		"",
 		"",
 		map[string]string{}, // no specter:owner
 		map[string]string{},
