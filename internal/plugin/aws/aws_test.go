@@ -6,6 +6,7 @@ package aws
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -704,5 +705,109 @@ func TestAppendPassRoleAndRunTaskWildcardFindings_DoesNotDuplicateAcrossRepeated
 	appendPassRoleAndRunTaskWildcardFindings(&findings, agent, perms, time.Now())
 	if len(findings) != 1 {
 		t.Errorf("expected exactly 1 IAM_PASSROLE_WILDCARD finding even though the grant appears twice in perms, got %d: %+v", len(findings), findings)
+	}
+}
+
+// ── isCredentialError / classifyAWSScanOutcome ──────────────────────────────
+//
+// Regression coverage for the un-onboarded-account misclassification found
+// during live testing 2026-07-23: an account with no SpecterReadOnly role
+// deployed (or one with a broken trust policy) produced only AccessDenied
+// errors from every sub-scan, none of which matched the old
+// credentialErrorSignatures list, so the account was reported SUCCESS with
+// zero agents instead of FAILED. Confirmed live against a real un-onboarded
+// account (account 741987316968, the platform's own account, which has no
+// SpecterReadOnly role by design) before this fix, and again after.
+
+func TestIsCredentialError_RecognizesAccessDenied(t *testing.T) {
+	// Exact message shape observed live: an AssumeRole into a
+	// nonexistent/untrusted SpecterReadOnly role.
+	err := errors.New("operation error Lambda: ListFunctions, get identity: get credentials: failed to refresh cached credentials, operation error STS: AssumeRole, https response error StatusCode: 403, api error AccessDenied: User: arn:aws:sts::741987316968:assumed-role/AWSReservedSSO_AdministratorAccess_abca57d481642433/bo.mukete is not authorized to perform: sts:AssumeRole on resource: arn:aws:iam::741987316968:role/SpecterReadOnly")
+	if !isCredentialError(err) {
+		t.Error("expected an AssumeRole AccessDenied error to be classified as a credential/access error")
+	}
+}
+
+func TestIsCredentialError_StillRecognizesOriginalSignatures(t *testing.T) {
+	for _, msg := range []string{
+		"ExpiredToken: token has expired",
+		"NoCredentialProviders: no valid providers in chain",
+		"InvalidClientTokenId: the security token is invalid",
+	} {
+		if !isCredentialError(errors.New(msg)) {
+			t.Errorf("expected pre-existing signature to still match: %q", msg)
+		}
+	}
+}
+
+func TestIsCredentialError_DoesNotMatchUnrelatedErrors(t *testing.T) {
+	for _, msg := range []string{
+		"ResourceNotFoundException: function not found",
+		"ThrottlingException: rate exceeded",
+		"context deadline exceeded",
+	} {
+		if isCredentialError(errors.New(msg)) {
+			t.Errorf("expected unrelated error not to be classified as a credential/access error: %q", msg)
+		}
+	}
+	if isCredentialError(nil) {
+		t.Error("expected nil error to not be classified as a credential error")
+	}
+}
+
+// TestClassifyAWSScanOutcome_NotOnboarded_ReturnsAuthError is the direct
+// regression test for the un-onboarded-account bug: zero agents found and
+// every sub-scan failed with an AccessDenied-class error (no role deployed,
+// or a broken trust policy) must classify as a real access failure.
+func TestClassifyAWSScanOutcome_NotOnboarded_ReturnsAuthError(t *testing.T) {
+	subErrs := []error{
+		errors.New("api error AccessDenied: ... not authorized to perform: sts:AssumeRole on resource: .../SpecterReadOnly"),
+		errors.New("api error AccessDenied: ... not authorized to perform: sts:AssumeRole on resource: .../SpecterReadOnly"),
+		errors.New("api error AccessDenied: ... not authorized to perform: sts:AssumeRole on resource: .../SpecterReadOnly"),
+	}
+	err := classifyAWSScanOutcome(0, subErrs)
+	var authErr *plugin.AuthError
+	if !errors.As(err, &authErr) {
+		t.Fatalf("expected a *plugin.AuthError for an un-onboarded account (0 agents, all sub-errors AccessDenied), got %v", err)
+	}
+	if authErr.PluginName != "aws" {
+		t.Errorf("expected PluginName %q, got %q", "aws", authErr.PluginName)
+	}
+}
+
+// TestClassifyAWSScanOutcome_GenuinelyEmpty_ReturnsNil is the contrasting
+// case the fix must not break: a genuinely onboarded account with zero
+// agents and zero sub-scan errors (every AWS call succeeded, there was
+// simply nothing to find) must still report success, not a false failure.
+func TestClassifyAWSScanOutcome_GenuinelyEmpty_ReturnsNil(t *testing.T) {
+	if err := classifyAWSScanOutcome(0, nil); err != nil {
+		t.Errorf("expected nil (success) for a genuinely empty, reachable account, got %v", err)
+	}
+}
+
+// TestClassifyAWSScanOutcome_PartialAccessDenied_ReturnsNil confirms a
+// role that's deployed and trusted but missing some specific action grants
+// (some sub-scans fail, others succeed with real findings) is never
+// escalated to a hard failure — that's meaningfully different from "no
+// access at all" and must keep reporting whatever it did find.
+func TestClassifyAWSScanOutcome_PartialAccessDenied_ReturnsNil(t *testing.T) {
+	subErrs := []error{errors.New("api error AccessDenied: ... codecommit:ListRepositories")}
+	if err := classifyAWSScanOutcome(3, subErrs); err != nil {
+		t.Errorf("expected nil when agents were found despite a partial AccessDenied, got %v", err)
+	}
+}
+
+// TestClassifyAWSScanOutcome_MixedNonCredentialErrors_ReturnsNil confirms a
+// sub-error that isn't credential/access-shaped (e.g. a transient
+// throttling error) does not get force-classified as a hard access
+// failure just because agentsFound is 0 — only a unanimous run of
+// credential/access errors does.
+func TestClassifyAWSScanOutcome_MixedNonCredentialErrors_ReturnsNil(t *testing.T) {
+	subErrs := []error{
+		errors.New("api error AccessDenied: ... not authorized to perform: sts:AssumeRole"),
+		errors.New("ThrottlingException: rate exceeded"),
+	}
+	if err := classifyAWSScanOutcome(0, subErrs); err != nil {
+		t.Errorf("expected nil when not every sub-error is credential/access-shaped, got %v", err)
 	}
 }

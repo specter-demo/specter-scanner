@@ -39,7 +39,11 @@ const defaultOrgReadOnlyRoleName = "SpecterReadOnly"
 // would — the platform's own identity doesn't need to assume a role into
 // itself to see itself), it simply shows up as a FAILED entry like any
 // other un-onboarded member account, which is the correct, honest
-// per-account status.
+// per-account status — this depends on isCredentialError recognizing the
+// AccessDenied that an sts:AssumeRole into a missing/untrusted role
+// produces (see credentialErrorSignatures in aws.go); confirmed live
+// 2026-07-23 against this account's own un-onboarded state, which
+// previously reported SUCCESS with zero agents instead.
 func (p *Plugin) ScanOrganization(ctx context.Context, roleNameTemplate string) (*plugin.ScanResult, []plugin.AccountScanResult, error) {
 	if roleNameTemplate == "" {
 		roleNameTemplate = defaultOrgReadOnlyRoleName

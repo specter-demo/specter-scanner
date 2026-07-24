@@ -133,9 +133,23 @@ func (p *Plugin) HealthCheck(ctx context.Context) error {
 }
 
 // credentialErrorSignatures are substrings of AWS SDK error messages that
-// indicate an authentication/credential failure, as opposed to a successful
-// call that simply found zero results. Matched against err.Error() since the
-// SDK wraps the underlying API error code into the error string.
+// indicate the plugin could not establish a usable identity in the target
+// account at all — bad/expired/missing static credentials, or an
+// sts:AssumeRole into the per-account SpecterReadOnly role that was denied
+// (no role deployed there, or one with a trust policy that doesn't trust
+// this caller) — as opposed to a successful call that simply found zero
+// results. Matched against err.Error() since the SDK wraps the underlying
+// API error code into the error string.
+//
+// "AccessDenied" covers the AssumeRole-failure case specifically: AWS STS
+// returns this same error code whether the target role doesn't exist or
+// its trust policy doesn't permit this caller — it never reveals which,
+// by design (see https://docs.aws.amazon.com/IAM/latest/UserGuide/reference_policies_troubleshoot.html#troubleshoot_general-access-denied-not-authorized).
+// Confirmed via a live scan against a real un-onboarded account: every
+// Lambda/ECS/Bedrock sub-scan failed with "AccessDenied: ... not
+// authorized to perform: sts:AssumeRole on resource: .../SpecterReadOnly",
+// none of which matched the previous signature list, so the account was
+// reported SUCCESS with zero agents instead of FAILED.
 var credentialErrorSignatures = []string{
 	"InvalidClientTokenId",
 	"UnrecognizedClientException",
@@ -145,13 +159,17 @@ var credentialErrorSignatures = []string{
 	"could not find AWS credentials",
 	"SignatureDoesNotMatch",
 	"AuthFailure",
+	"AccessDenied",
 }
 
-// isCredentialError reports whether err looks like an authentication failure
-// (bad/expired/missing credentials) rather than a permissions or transient
-// network error. Used to distinguish "every plugin call failed because
-// credentials are broken" (no report should be written) from "credentials
-// are fine, the account just has zero agents" (a valid empty-result scan).
+// isCredentialError reports whether err looks like an authentication or
+// total-access failure (bad/expired/missing credentials, or an AssumeRole
+// denied because the target role doesn't exist or doesn't trust this
+// caller) rather than an in-account permissions gap or transient network
+// error. Used to distinguish "every plugin call failed because this
+// account couldn't be reached at all" (no report should be written) from
+// "credentials are fine, the account just has zero agents" (a valid
+// empty-result scan).
 func isCredentialError(err error) bool {
 	if err == nil {
 		return false
@@ -163,6 +181,34 @@ func isCredentialError(err error) bool {
 		}
 	}
 	return false
+}
+
+// classifyAWSScanOutcome decides, from the number of agents Scan() found
+// and the sub-scan errors it collected along the way, whether the overall
+// scan should be reported as a real access failure (nothing could be
+// reached — no SpecterReadOnly role deployed, or one with a broken trust
+// policy) as opposed to a clean scan that simply found zero agents.
+// Returns a non-nil *plugin.AuthError only when every sub-scan that ran
+// failed and every one of those failures looks like a credential/access
+// error; returns nil (meaning: report success, however empty) in every
+// other case, including a genuinely empty but reachable account (zero
+// agents, zero sub-errors).
+//
+// Extracted as a pure function — mirrors scanAccountsWithPartialFailure's
+// own extraction in organization.go, for the same reason: this exact
+// decision needs to be unit-testable without live AWS credentials, since
+// it's the one place a real un-onboarded account was silently
+// misclassified as SUCCESS (see credentialErrorSignatures' doc comment).
+func classifyAWSScanOutcome(agentsFound int, subErrs []error) error {
+	if agentsFound > 0 || len(subErrs) == 0 {
+		return nil
+	}
+	for _, e := range subErrs {
+		if !isCredentialError(e) {
+			return nil
+		}
+	}
+	return &plugin.AuthError{PluginName: "aws", Err: subErrs[0]}
 }
 
 func (p *Plugin) Scan(ctx context.Context) (*plugin.ScanResult, error) {
@@ -204,21 +250,12 @@ func (p *Plugin) Scan(ctx context.Context) (*plugin.ScanResult, error) {
 	result.Agents = append(result.Agents, bedrockAgents...)
 	result.Findings = append(result.Findings, bedrockFindings...)
 
-	// If every sub-scan that ran failed with a credential error and nothing
-	// was discovered, this is an authentication failure, not a clean empty
+	// If every sub-scan that ran failed with a credential/access error and
+	// nothing was discovered, this is an access failure, not a clean empty
 	// account — surface it as an error instead of letting Scan() return a
 	// zero-agent result that looks identical to a valid empty scan.
-	if len(result.Agents) == 0 && len(subErrs) > 0 {
-		allCredentialErrors := true
-		for _, e := range subErrs {
-			if !isCredentialError(e) {
-				allCredentialErrors = false
-				break
-			}
-		}
-		if allCredentialErrors {
-			return result, &plugin.AuthError{PluginName: "aws", Err: subErrs[0]}
-		}
+	if authErr := classifyAWSScanOutcome(len(result.Agents), subErrs); authErr != nil {
+		return result, authErr
 	}
 
 	// Step 4: IAM role provenance for all discovered agents
