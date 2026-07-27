@@ -796,10 +796,8 @@ func (p *Plugin) scanBedrock(ctx context.Context) ([]types.CanonicalAgentRecord,
 	client := bedrockagent.NewFromConfig(p.awsConf)
 	now := time.Now().UTC()
 
-	// Resolve the real AWS account ID for constructing valid tag-fetch ARNs.
+	// Resolve the real AWS account ID for constructing valid ARNs.
 	// ListAgents only returns agent IDs/names, so we must synthesise the ARN ourselves.
-	// The ExternalID stored in the DB uses p.cfg.OrgID for backward compatibility;
-	// for the ListTagsForResource call we need the numeric account ID.
 	realAccountID := p.cfg.OrgID // fallback to orgId if STS call fails
 	if stsOut, err := sts.NewFromConfig(p.awsConf).GetCallerIdentity(ctx, &sts.GetCallerIdentityInput{}); err == nil {
 		if id := aws.ToString(stsOut.Account); id != "" {
@@ -823,17 +821,19 @@ func (p *Plugin) scanBedrock(ctx context.Context) ([]types.CanonicalAgentRecord,
 		for _, summary := range out.AgentSummaries {
 			agentID := aws.ToString(summary.AgentId)
 			name := aws.ToString(summary.AgentName)
-			// agentARN uses p.cfg.OrgID so ExternalID/StableID stay stable across scans
-			// (backward-compatible with existing DB records).
+			// agentARN uses the real numeric account ID — a syntactically valid
+			// ARN, and required for a valid ListTagsForResource call below.
+			// Previously this used p.cfg.OrgID as a placeholder in the account
+			// position, which meant two Bedrock agents with the same
+			// underlying agentID in different member accounts would collide
+			// onto the same StableID (see stableID below) — fixed 2026-07-27;
+			// existing DB records migrated via prisma/migrate-bedrock-stableid.ts
+			// in specter-platform.
 			agentARN := fmt.Sprintf("arn:aws:bedrock:%s:%s:agent/%s",
-				p.awsConf.Region, p.cfg.OrgID, agentID)
-			// tagsARN uses the real numeric account ID — required for a valid AWS API call.
-			tagsARN := fmt.Sprintf("arn:aws:bedrock:%s:%s:agent/%s",
 				p.awsConf.Region, realAccountID, agentID)
 
-			// Fetch tags using the real ARN
 			tagsOut, err := client.ListTagsForResource(ctx, &bedrockagent.ListTagsForResourceInput{
-				ResourceArn: aws.String(tagsARN),
+				ResourceArn: aws.String(agentARN),
 			})
 			tags := map[string]string{}
 			if err == nil {
@@ -851,16 +851,11 @@ func (p *Plugin) scanBedrock(ctx context.Context) ([]types.CanonicalAgentRecord,
 				Platform:   "AWS_BEDROCK",
 				ExternalID: agentARN,
 				StableID:   stableID(p.cfg.OrgID, agentARN),
-				// AccountID uses the real numeric account ID (see
-				// realAccountID above), unlike ExternalID/StableID which
-				// deliberately use OrgID as a placeholder for backward
-				// compatibility. Known, not-fixed-here limitation: since
-				// ExternalID/StableID don't vary by account, two Bedrock
-				// agents with the same underlying agentID in different
-				// member accounts would collide onto the same StableID —
-				// low real-world probability (Bedrock agent IDs are
-				// random), but a real latent gap multi-account scanning
-				// newly exposes. AccountID itself is correct regardless.
+				// AccountID and ExternalID/StableID all now use the real
+				// numeric account ID (realAccountID above) — a real,
+				// syntactically valid ARN, and no longer collision-prone
+				// across accounts within the same org (fixed 2026-07-27;
+				// see agentARN's comment above).
 				AccountID:       realAccountID,
 				AgentClassTag:   tags["specter:agent-class"],
 				OwnerTag:        tags["specter:owner"],
