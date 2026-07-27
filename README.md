@@ -18,6 +18,7 @@ Specter Scanner is the open-core foundation of the [Specter Platform](https://sp
 - IAM roles, creators, and permission scope for each agent
 - Cross-account IAM trust policies missing an `sts:ExternalId` condition
 - IAM Identity Center permission sets with zero account assignments (requires running from the AWS Organizations management account)
+- EventBridge rules whose target resolves to a known agent — an authoritative, non-CloudTrail signal that the agent has an unattended (EventBridge-mediated) invocation path
 
 **AWS CI/CD pipelines:**
 - CodeCommit repositories: declared intent (`.specter/manifest.yaml`, `AGENT.md`, `CLAUDE.md`) and committed secrets, correlated to the agent they build
@@ -212,7 +213,11 @@ The scanner requires read-only access to your AWS account. Create an IAM role wi
         "codepipeline:ListPipelines",
         "codepipeline:GetPipeline",
         "codedeploy:ListApplications",
-        "codedeploy:ListDeploymentGroups"
+        "codedeploy:ListDeploymentGroups",
+        "events:ListRules",
+        "events:DescribeRule",
+        "events:ListTargetsByRule",
+        "events:ListTagsForResource"
       ],
       "Resource": "*"
     }
@@ -221,6 +226,8 @@ The scanner requires read-only access to your AWS account. Create an IAM role wi
 ```
 
 `iam:ListRoles` is new as of the CI/CD and Organizations discovery steps — it's needed to find cross-account IAM roles that aren't attached to any Lambda/ECS/Bedrock agent (e.g. a role that exists purely as a cross-account assume-role target).
+
+The `events:*` actions are for direct EventBridge rule enumeration — the scanner resolves each rule's target back to a known agent by ARN match, which authoritatively confirms an EventBridge-mediated (unattended) invocation path rather than inferring it from CloudTrail's `SCHEDULER` classification alone.
 
 **Organizations and IAM Identity Center discovery is optional and management-account-only.** `ORG_CROSS_ACCOUNT_NO_EXTERNAL_ID` and `SSO_ORPHANED_PERMISSION_SET` need these additional permissions, and only produce results when the scanner runs with credentials from your AWS Organizations *management* account — both services are org-wide, not visible from a member account, even via the cross-account role above. Running without them is fully supported: the scanner logs the permission error and skips these two checks, same as any other AWS API call it isn't authorized for.
 
