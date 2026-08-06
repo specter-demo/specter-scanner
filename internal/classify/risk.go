@@ -10,20 +10,22 @@ import (
 // ComputeRiskScore computes a 0–100 risk score for an agent (spec section 6.5).
 //
 // Base score from visibility:
-//   SHADOW       → 40
-//   DISCOVERED   → 20
-//   GOVERNED     → 5
-//   UNREGISTERED → 30
+//
+//	SHADOW       → 40
+//	DISCOVERED   → 20
+//	GOVERNED     → 5
+//	UNREGISTERED → 30
 //
 // Modifiers:
-//   +20 if HasWildcard (IAM wildcard permissions)
-//   +15 if FunctionURLAuthType == "NONE"
-//   +10 per CRITICAL finding (capped at +30)
-//   +5  per HIGH finding (capped at +20)
-//   +10 if CONFIRMED_ORCHESTRATOR
-//   +5  if LIKELY_ORCHESTRATOR
-//   +10 if cross-org edge exists
-//   +5  per outbound ENV_URL edge (capped at +15)
+//
+//	+20 if HasWildcard (IAM wildcard permissions)
+//	+15 if FunctionURLAuthType == "NONE"
+//	+10 per CRITICAL finding (capped at +30)
+//	+5  per HIGH finding (capped at +20)
+//	+10 if CONFIRMED_ORCHESTRATOR
+//	+5  if LIKELY_ORCHESTRATOR
+//	+10 if cross-org edge exists
+//	+5  per outbound ENV_URL edge (capped at +15)
 //
 // Fixed 2026-08-05: the per-finding modifiers above were documented here
 // but never implemented — this function didn't even take a findings
@@ -36,6 +38,23 @@ import (
 // normal case. Confirmed live: org_vantage_demo had 12 OPEN HIGH findings
 // and 14 OPEN MEDIUM findings across its 12 agents, yet zero agents in
 // either tier — this is that bug, not a coincidence.
+//
+// Changed 2026-08-06: GOVERNED's base (5) meant reaching HIGH (50-74)
+// required BOTH the capped CRITICAL bonus (+30) AND the capped HIGH bonus
+// (+20) simultaneously (5+30=35 or 5+20=25 alone, both only MEDIUM) — an
+// unrealistically demanding bar most real agents would never clear, found
+// during the same investigation that surfaced the SHADOW/UNREGISTERED
+// HIGH-window gap. Deliberate design decision: either capped contribution
+// alone should now be sufficient for a GOVERNED agent to reach HIGH.
+// Implemented as a GOVERNED-scoped floor (score raised to at least 50 when
+// either cap is independently hit) rather than raising the shared +30/+20
+// cap constants themselves, since those are added identically for every
+// visibility class — inflating them would have silently changed
+// SHADOW/DISCOVERED/UNREGISTERED scoring too. The floor is 50, well under
+// the 75 CRITICAL threshold, so it cannot affect GOVERNED's path to
+// CRITICAL, which still requires the natural additive total (base +
+// findings + wildcard/URL/orchestrator/edge modifiers) to reach 75 on its
+// own — unchanged by this edit.
 func ComputeRiskScore(agent *types.CanonicalAgentRecord, edges []types.AgentEdgeRecord, findings []types.FindingRecord) int {
 	score := 0
 
@@ -77,15 +96,23 @@ func ComputeRiskScore(agent *types.CanonicalAgentRecord, edges []types.AgentEdge
 			highFindings++
 		}
 	}
-	if add := criticalFindings * 10; add > 30 {
+	// "Capped" means the contribution reached the cap value (>=30, >=20),
+	// not merely exceeded it — at exactly 3 CRITICAL findings the raw
+	// value (30) already equals the cap, so it must count as capped for
+	// the GOVERNED floor below; a strict ">" here would inconsistently
+	// treat 3 findings (score contribution 30) and 4 findings (also
+	// capped at 30) differently despite identical score impact.
+	criticalCapped := criticalFindings*10 >= 30
+	if criticalCapped {
 		score += 30
 	} else {
-		score += add
+		score += criticalFindings * 10
 	}
-	if add := highFindings * 5; add > 20 {
+	highCapped := highFindings*5 >= 20
+	if highCapped {
 		score += 20
 	} else {
-		score += add
+		score += highFindings * 5
 	}
 
 	// Orchestrator bonus
@@ -115,6 +142,14 @@ func ComputeRiskScore(agent *types.CanonicalAgentRecord, edges []types.AgentEdge
 			add = 15
 		}
 		score += add
+	}
+
+	// GOVERNED HIGH floor: either capped severity contribution alone is
+	// sufficient to reach the HIGH band (50), not just both together. Well
+	// under the 75 CRITICAL floor, so this cannot affect CRITICAL
+	// reachability for GOVERNED agents — see 2026-08-06 doc comment above.
+	if agent.VisibilityClass == types.VisibilityClassGoverned && (criticalCapped || highCapped) && score < 50 {
+		score = 50
 	}
 
 	// Cap at 100

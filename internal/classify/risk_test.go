@@ -59,25 +59,31 @@ func TestComputeRiskScore_FindingSeverityModifiers(t *testing.T) {
 		}
 	})
 
-	t.Run("CRITICAL findings capped at +30 (3 findings = cap, not 40)", func(t *testing.T) {
+	t.Run("CRITICAL findings capped at +30 (4 findings = cap, not 40)", func(t *testing.T) {
+		// Uses a DISCOVERED agent, not the shared GOVERNED one above — the
+		// 2026-08-06 GOVERNED HIGH floor (see TestComputeRiskScore_GovernedHighFloor)
+		// would otherwise interfere with isolating the raw cap arithmetic
+		// this case exists to check.
+		discovered := &types.CanonicalAgentRecord{StableID: "agent-2", VisibilityClass: types.VisibilityClassDiscovered}
 		findings := make([]types.FindingRecord, 4)
 		for i := range findings {
-			findings[i] = types.FindingRecord{AgentStableID: "agent-1", Severity: "CRITICAL"}
+			findings[i] = types.FindingRecord{AgentStableID: "agent-2", Severity: "CRITICAL"}
 		}
-		got := ComputeRiskScore(agent, nil, findings)
-		want := 5 + 30 // base + capped CRITICAL bonus, not 5+40
+		got := ComputeRiskScore(discovered, nil, findings)
+		want := 20 + 30 // DISCOVERED base + capped CRITICAL bonus, not 20+40
 		if got != want {
 			t.Errorf("got %d, want %d (CRITICAL bonus should cap at +30)", got, want)
 		}
 	})
 
 	t.Run("HIGH findings capped at +20 (5 findings = cap, not 25)", func(t *testing.T) {
+		discovered := &types.CanonicalAgentRecord{StableID: "agent-3", VisibilityClass: types.VisibilityClassDiscovered}
 		findings := make([]types.FindingRecord, 5)
 		for i := range findings {
-			findings[i] = types.FindingRecord{AgentStableID: "agent-1", Severity: "HIGH"}
+			findings[i] = types.FindingRecord{AgentStableID: "agent-3", Severity: "HIGH"}
 		}
-		got := ComputeRiskScore(agent, nil, findings)
-		want := 5 + 20 // base + capped HIGH bonus, not 5+25
+		got := ComputeRiskScore(discovered, nil, findings)
+		want := 20 + 20 // DISCOVERED base + capped HIGH bonus, not 20+25
 		if got != want {
 			t.Errorf("got %d, want %d (HIGH bonus should cap at +20)", got, want)
 		}
@@ -121,11 +127,17 @@ func TestComputeRiskScore_AllFourTiersReachableWithRealFindings(t *testing.T) {
 		wantTier string
 	}{
 		{"zero findings -> LOW", "a-low", nil, "LOW"},
-		{"3 HIGH findings (5 + 15 = 20) -> LOW", "a-low2", mkFindings("a-low2", "HIGH", 3), "LOW"},
-		{"5 HIGH findings (5 + 20 = 25) -> MEDIUM", "a-medium", mkFindings("a-medium", "HIGH", 5), "MEDIUM"},
-		{"5 CRITICAL findings (5 + 30 = 35, capped) -> MEDIUM", "a-medium2", mkFindings("a-medium2", "CRITICAL", 5), "MEDIUM"},
-		{"2 CRITICAL + 5 HIGH (5 + 20 + 20 = 45) -> MEDIUM", "a-medium3", append(mkFindings("a-medium3", "CRITICAL", 2), mkFindings("a-medium3", "HIGH", 5)...), "MEDIUM"},
-		{"5 CRITICAL + 5 HIGH (5 + 30 + 20 = 55) -> HIGH", "a-high", append(mkFindings("a-high", "CRITICAL", 5), mkFindings("a-high", "HIGH", 5)...), "HIGH"},
+		{"3 HIGH findings (5 + 15 = 20, HIGH not yet capped) -> LOW", "a-low2", mkFindings("a-low2", "HIGH", 3), "LOW"},
+		{"2 CRITICAL + 2 HIGH, neither capped (5 + 20 + 10 = 35) -> MEDIUM", "a-medium", append(mkFindings("a-medium", "CRITICAL", 2), mkFindings("a-medium", "HIGH", 2)...), "MEDIUM"},
+		// 2026-08-06: these three used to land at MEDIUM before the GOVERNED
+		// HIGH-floor change — either capped severity alone now reaches HIGH.
+		// See TestComputeRiskScore_GovernedHighFloor for the dedicated,
+		// minimal cases; these stay here to confirm the floor holds even
+		// mixed in with the original end-to-end all-tiers scenario.
+		{"5 HIGH findings, capped (5 + 20 -> floored to 50) -> HIGH", "a-medium2", mkFindings("a-medium2", "HIGH", 5), "HIGH"},
+		{"5 CRITICAL findings, capped (5 + 30 -> floored to 50) -> HIGH", "a-medium3", mkFindings("a-medium3", "CRITICAL", 5), "HIGH"},
+		{"2 CRITICAL (uncapped) + 5 HIGH (capped) -> floored to 50 -> HIGH", "a-medium4", append(mkFindings("a-medium4", "CRITICAL", 2), mkFindings("a-medium4", "HIGH", 5)...), "HIGH"},
+		{"5 CRITICAL + 5 HIGH (5 + 30 + 20 = 55, both capped, already above floor) -> HIGH", "a-high", append(mkFindings("a-high", "CRITICAL", 5), mkFindings("a-high", "HIGH", 5)...), "HIGH"},
 		{"8 CRITICAL findings (5 + 30 capped = 35) plus wildcard -> CRITICAL", "a-critical", mkFindings("a-critical", "CRITICAL", 8), "CRITICAL"},
 	}
 
@@ -152,6 +164,108 @@ func TestComputeRiskScore_AllFourTiersReachableWithRealFindings(t *testing.T) {
 			t.Errorf("tier %s was never reached by any case — regression not fully covered", tier)
 		}
 	}
+}
+
+// 2026-08-06: GOVERNED previously required BOTH the capped CRITICAL bonus
+// (+30) AND the capped HIGH bonus (+20) simultaneously to reach HIGH — each
+// alone only produced MEDIUM (5+30=35, 5+20=25). Deliberate design change:
+// either capped contribution alone is now sufficient. These are the
+// minimal, dedicated cases; TestComputeRiskScore_AllFourTiersReachableWithRealFindings
+// additionally exercises the same floor mixed into the broader scenario.
+func TestComputeRiskScore_GovernedHighFloor(t *testing.T) {
+	mkGoverned := func(id string) *types.CanonicalAgentRecord {
+		return &types.CanonicalAgentRecord{StableID: id, VisibilityClass: types.VisibilityClassGoverned}
+	}
+	mkFindings := func(agentID string, severity string, count int) []types.FindingRecord {
+		fs := make([]types.FindingRecord, count)
+		for i := range fs {
+			fs[i] = types.FindingRecord{AgentStableID: agentID, Severity: severity}
+		}
+		return fs
+	}
+
+	t.Run("CRITICAL findings alone, capped (3 findings = 5+30=35 natural) -> floored to HIGH", func(t *testing.T) {
+		agent := mkGoverned("g-1")
+		findings := mkFindings("g-1", "CRITICAL", 3) // exactly at the cap boundary
+		score := ComputeRiskScore(agent, nil, findings)
+		if score != 50 {
+			t.Errorf("score = %d, want 50 (floored)", score)
+		}
+		if tier := deriveRiskTier(score); tier != "HIGH" {
+			t.Errorf("tier = %s, want HIGH", tier)
+		}
+	})
+
+	t.Run("HIGH findings alone, capped (4 findings = 5+20=25 natural) -> floored to HIGH", func(t *testing.T) {
+		agent := mkGoverned("g-2")
+		findings := mkFindings("g-2", "HIGH", 4) // exactly at the cap boundary
+		score := ComputeRiskScore(agent, nil, findings)
+		if score != 50 {
+			t.Errorf("score = %d, want 50 (floored)", score)
+		}
+		if tier := deriveRiskTier(score); tier != "HIGH" {
+			t.Errorf("tier = %s, want HIGH", tier)
+		}
+	})
+
+	t.Run("CRITICAL findings just under the cap (2 findings) -> NOT floored, stays MEDIUM", func(t *testing.T) {
+		agent := mkGoverned("g-3")
+		findings := mkFindings("g-3", "CRITICAL", 2) // 5+20=25, below the cap, floor must not apply
+		score := ComputeRiskScore(agent, nil, findings)
+		if score != 25 {
+			t.Errorf("score = %d, want 25 (no floor — cap not reached)", score)
+		}
+		if tier := deriveRiskTier(score); tier != "MEDIUM" {
+			t.Errorf("tier = %s, want MEDIUM — floor should only apply once a cap is actually hit", tier)
+		}
+	})
+
+	t.Run("HIGH findings just under the cap (3 findings) -> NOT floored, stays LOW", func(t *testing.T) {
+		agent := mkGoverned("g-4")
+		findings := mkFindings("g-4", "HIGH", 3) // 5+15=20, below the cap
+		score := ComputeRiskScore(agent, nil, findings)
+		if score != 20 {
+			t.Errorf("score = %d, want 20 (no floor — cap not reached)", score)
+		}
+		if tier := deriveRiskTier(score); tier != "LOW" {
+			t.Errorf("tier = %s, want LOW", tier)
+		}
+	})
+
+	t.Run("GOVERNED CRITICAL threshold is unaffected by the floor", func(t *testing.T) {
+		// The floor is 50, nowhere near the 75 CRITICAL boundary — a
+		// GOVERNED agent must still reach 75 through its own natural
+		// additive total. Confirm the exact same modifier combination that
+		// reached CRITICAL before this change still does, and that a
+		// capped-severity-only agent (which would previously have topped
+		// out at 35, now floored to 50/HIGH) does NOT reach CRITICAL.
+		t.Run("capped CRITICAL findings alone, no other modifiers -> HIGH, not CRITICAL", func(t *testing.T) {
+			agent := mkGoverned("g-5")
+			findings := mkFindings("g-5", "CRITICAL", 8) // heavily over the cap, still just +30
+			score := ComputeRiskScore(agent, nil, findings)
+			if score != 50 {
+				t.Errorf("score = %d, want 50 — the floor must not overshoot into CRITICAL territory", score)
+			}
+			if tier := deriveRiskTier(score); tier != "HIGH" {
+				t.Errorf("tier = %s, want HIGH", tier)
+			}
+		})
+
+		t.Run("capped CRITICAL + wildcard + open URL + orchestrator still reaches CRITICAL exactly as before (5+30+20+15+10=80)", func(t *testing.T) {
+			agent := mkGoverned("g-6")
+			agent.HasWildcard = true
+			agent.FunctionURLAuthType = "NONE"
+			agent.FunctionalClass = types.FunctionalClassConfirmedOrchestrator
+			findings := mkFindings("g-6", "CRITICAL", 8)
+			score := ComputeRiskScore(agent, nil, findings)
+			if score != 80 {
+				t.Errorf("score = %d, want 80 — same natural total as before this change; the floor must be a no-op once the natural score already exceeds it", score)
+			}
+			if tier := deriveRiskTier(score); tier != "CRITICAL" {
+				t.Errorf("tier = %s, want CRITICAL", tier)
+			}
+		})
+	})
 }
 
 // 2026-08-06: every case above uses VisibilityClassGoverned exclusively —
