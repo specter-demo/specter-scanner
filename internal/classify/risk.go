@@ -24,7 +24,19 @@ import (
 //   +5  if LIKELY_ORCHESTRATOR
 //   +10 if cross-org edge exists
 //   +5  per outbound ENV_URL edge (capped at +15)
-func ComputeRiskScore(agent *types.CanonicalAgentRecord, edges []types.AgentEdgeRecord) int {
+//
+// Fixed 2026-08-05: the per-finding modifiers above were documented here
+// but never implemented — this function didn't even take a findings
+// parameter, so an agent's actual CRITICAL/HIGH finding count had zero
+// effect on its score. In practice this meant risk tiers could only ever
+// land at CRITICAL (via the SHADOW+wildcard+open-URL combination summing
+// to exactly 75) or LOW (govern/discovered base with few modifiers) —
+// HIGH (50-74) and MEDIUM (25-49) were structurally unreachable for any
+// agent whose risk was actually driven by its findings, which is the
+// normal case. Confirmed live: org_vantage_demo had 12 OPEN HIGH findings
+// and 14 OPEN MEDIUM findings across its 12 agents, yet zero agents in
+// either tier — this is that bug, not a coincidence.
+func ComputeRiskScore(agent *types.CanonicalAgentRecord, edges []types.AgentEdgeRecord, findings []types.FindingRecord) int {
 	score := 0
 
 	// Base from visibility
@@ -49,6 +61,31 @@ func ComputeRiskScore(agent *types.CanonicalAgentRecord, edges []types.AgentEdge
 	// Public function URL with no auth
 	if agent.FunctionURLAuthType == "NONE" {
 		score += 15
+	}
+
+	// Per-finding severity modifiers — counts only this agent's own
+	// findings (matched by StableID), each capped independently.
+	var criticalFindings, highFindings int
+	for _, f := range findings {
+		if f.AgentStableID != agent.StableID {
+			continue
+		}
+		switch f.Severity {
+		case "CRITICAL":
+			criticalFindings++
+		case "HIGH":
+			highFindings++
+		}
+	}
+	if add := criticalFindings * 10; add > 30 {
+		score += 30
+	} else {
+		score += add
+	}
+	if add := highFindings * 5; add > 20 {
+		score += 20
+	} else {
+		score += add
 	}
 
 	// Orchestrator bonus

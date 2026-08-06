@@ -189,7 +189,7 @@ func main() {
 		agent.FunctionalClass = classify.ClassifyFunctional(agent, result.Edges)
 		agent.VisibilityClass = computeVisibility(agent)
 		agent.IsShadow = agent.VisibilityClass == types.VisibilityClassShadow
-		agent.RiskScore = classify.ComputeRiskScore(agent, result.Edges)
+		agent.RiskScore = classify.ComputeRiskScore(agent, result.Edges, result.Findings)
 	}
 
 	// Re-partition using post-classification values — blast radius and chain
